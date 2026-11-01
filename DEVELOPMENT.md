@@ -15,9 +15,9 @@ source ./dev-env.sh
 
 `dev-env.sh` must be sourced from Bash. It checks the container name and selects dedicated Cargo/Rustup homes under `${XDG_DATA_HOME:-$HOME/.local/share}/cosmos-toolchain/`. Toolbox shares the user's home directory: these files are separate from other toolchains, but are not isolated by a filesystem sandbox. No mise configuration or shell startup file is changed. Source this environment before launching OMP so its child commands inherit it.
 
-## Native packages: owner action required
+## Native packages
 
-The setup session reached `cosmos`, but `sudo -n true` reported that a password is required. Native dependencies were NOT installed by that session. Run this interactively inside `cosmos`:
+All 24 packages in `dependencies-fedora.txt` were verified as installed inside `cosmos` on 2026-11-01. For a fresh toolbox, install them interactively:
 
 ```bash
 mapfile -t packages < dependencies-fedora.txt
@@ -32,7 +32,7 @@ sudo dnf install "${packages[@]}"
 
 Installing these packages is not permission to start or enable another audio session manager against the host graph. Do not run `systemctl --user enable/start/restart pipewire` or WirePlumber setup commands as part of environment preparation. Toolbox can expose host session sockets and the host user service manager.
 
-This is a source-informed baseline, not a verified complete application build manifest. There is no Cargo application yet. Add any demonstrated missing dependencies to this list and explain them here during the first real build. Do not install GTK4, Qt, Tauri, Node, Bun, or a full desktop environment for the current frontend.
+This is the native dependency baseline. The Rust engine uses PipeWire 0.10.1 bindings with the `v1_2_0` API feature against native PipeWire 1.6.11. The native LV2 filter host links successfully to Lilv; direct Lilv development headers are not needed for this integration. The libcosmic application has not been built, so its complete native build requirements remain unverified. Do not install GTK4, Qt, Tauri, Node, Bun, or a full desktop environment for the current frontend.
 
 DNF resolves package versions from the enabled repositories. This file is NOT an RPM version lock. When CI/release packaging is introduced, use a pinned container image/repository snapshot and record resolved RPM versions; do not claim fully reproducible native dependencies yet.
 
@@ -96,4 +96,49 @@ Use a private runtime/config/state directory and an explicitly selected private 
 
 A native UI requires actual Wayland-session checks. Before a UI launch, verify the display and session sockets available inside the toolbox without changing the host. A headless successful build does not prove GNOME/Plasma/COSMIC compatibility.
 
-Once application code exists, use formatting, Clippy, compilation, relevant contract/behavior tests, real audio-path smoke checks, and GUI interaction checks. Use `--locked` where applicable after generating the lockfile. Avoid `--all-features` if the selected toolkit has mutually exclusive feature combinations; test the supported configurations explicitly.
+For Rust changes, run `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `cargo test --workspace --locked`, and `cargo clippy --workspace --all-targets --locked -- -D warnings`. Exercise the actual changed path as well. Avoid `--all-features` if the selected toolkit has mutually exclusive feature combinations.
+
+## Private DSP verification
+
+Run `./tests/private-pipewire/verify.py` inside `cosmos`. Add `--keep` to retain logs, graph snapshots, plugin metadata, and raw float samples. Failure always retains these files and prints their location.
+
+The harness uses a private socket, runtime, configuration, state, and HOME. It starts no hardware discovery or session manager. It uses native CLI tools only as test drivers, not as application control code. All audio is synthetic mono at 48 kHz. The filter-chain host runs in a separate test-owned process, not in the PipeWire daemon.
+
+Verified on 2026-11-01 with PipeWire 1.6.11 and LSP 1.2.29:
+
+- Gate suppresses a below-threshold signal and passes an above-threshold signal.
+- Compressor reduces a loud signal without changing a quiet signal.
+- Parametric EQ applies the configured -12 dB cut at 1 kHz.
+- Limiter holds the measured peak below its 0.1 ceiling.
+- Ordered gate/compressor/EQ/limiter chain produces processed samples before and after host recreation.
+- Missing mandatory plugin rejects host startup without publishing an endpoint or raw bypass.
+- Two private server restarts allow explicit host recreation and restore measured samples.
+
+PipeWire 1.6.11 `pw-cat` returns status 1 when finite recording reaches its sample limit. The harness checks that specific native result, empty recorder diagnostics, exact sample count, finite values, and DSP outcomes. It does not accept arbitrary failures.
+
+This proves native DSP feasibility, not application-owned DSP recovery. Live parameter changes, stereo DSP, device loss, multi-clock hardware, latency, UI behavior, and the full handover acceptance matrix remain unverified.
+
+## Discovery engine and control client
+
+The workspace contains `cosmos-control` (toolkit-independent protocol/client) and `cosmos-engine` (native PipeWire discovery and control server). Build after sourcing `dev-env.sh`:
+
+```sh
+cargo build --workspace --locked
+./target/debug/cosmos-engine --help
+./tests/engine-lifecycle.py
+```
+
+The lifecycle test uses a private server and three synthetic nodes. It does not connect to desktop audio. It checks server absence, mono/stereo/unsupported layouts, duplicate descriptions, three server restarts, stale-node removal, duplicate engine rejection, slow/oversized clients, crash recovery, and explicit stop. It also checks that existing user files survive and that non-private socket directories are rejected.
+
+The executable accepts `run [--socket PATH] [--remote NAME]` and `status|list|stop [--socket PATH]`. `run` stays in the foreground; launch it as a separate process when needed. Closing a control client does not stop it. Login startup is not installed or enabled. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, `run` connects read-only to the default PipeWire server; automated checks always override the remote and runtime directory.
+
+Lifecycle invariants:
+
+- Only the engine that holds the persistent socket lock can own the control endpoint. A stale socket can be reclaimed after a crash; ordinary files and symlinks are not replaced.
+- Socket parents must be private and user-owned. Ancestors must be root/user-owned, with write access restricted unless sticky. Toolbox maps `/tmp` ownership to UID 65534 here; lifecycle tests use `/var/tmp` rather than weaken these checks.
+- Every connection attempt has a new generation. Disconnect removes observed nodes and devices. Numeric IDs are valid only in that generation and are not durable device selection keys.
+- Reconnect delay grows from 250 ms to at most 2 s. Handshake timeout is 2 s. Control requests remain available while PipeWire is absent.
+- IPC accepts at most eight active clients, 4 KiB requests, and 2 MiB responses. Server requests have a 1 s deadline; client operations have a 2 s absolute deadline. Stop has a bounded acknowledgement period.
+- Discovery reports identity candidates and channel semantics. It does not select a microphone, remap channels, create routes/endpoints, load DSP, or change defaults.
+
+The locked dependency metadata contains 65 packages, including the two local crates. All external sources are crates.io registry packages; all have licence declarations. This metadata inspection is not a full licence/source/notice audit and does not authorize distribution. libcosmic is not yet a resolved dependency.

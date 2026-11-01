@@ -39,7 +39,7 @@ Use ASD-STE100 (Simplified Technical English) when communicating technical infor
 
 ## Project constraints (agent-generated)
 
-- Build Cosmos Audio Mixer from scratch. Do not fork, copy, or depend on Linuxmeeter code. Our application code is Rust; native PipeWire and LSP LV2 dependencies are permitted.
+- Build Cosmos Audio Mixer as an independent Rust application. Do not fork, translate, copy, or depend on another mixer's application code. Native PipeWire and LSP LV2 dependencies are permitted.
 - Use libcosmic for the native Wayland frontend. Keep the engine and its control protocol independent of the GUI toolkit. Defer the GTK4 frontend, repository split, Flatpak, and exact window placement.
 - The background engine must keep running when the window closes. Login startup is opt-in. Hardware aliases, visibility, and enable/disable controls are mixer-local; app-owned virtual endpoint names are system-visible. Initial supported workflows are mono/stereo; unsupported layouts must be reported, never silently remapped.
 - Device loss, profile changes, server restart, and engine failure must not block the GUI. Use controlled silence and explicit unavailable/error states rather than unprocessed audio or automatic substitution of another microphone. Do not claim uninterrupted audio while the source or audio server is absent.

@@ -1,0 +1,38 @@
+{
+  "gate": {
+    "plugin": "http://lsp-plug.in/plugins/lv2/gate_mono",
+    "control": {
+      "enabled": 1, "g_in": 1, "g_out": 1, "sci": 0,
+      "scm": 1, "scr": 5, "gt": 0.1, "gz": 0.1,
+      "gh": 0, "at": 5, "rt": 20, "hold": 0,
+      "gr": 0.0002511886, "mk": 1, "cdr": 0, "cwt": 1, "cdw": 100
+    }
+  },
+  "compressor": {
+    "plugin": "http://lsp-plug.in/plugins/lv2/compressor_mono",
+    "control": {
+      "enabled": 1, "g_in": 1, "g_out": 1, "sct": 0,
+      "scm": 1, "scr": 5, "cm": 0, "al": 0.1,
+      "at": 5, "rt": 20, "cr": 8, "kn": 1,
+      "mk": 1, "cdr": 0, "cwt": 1, "cdw": 100
+    }
+  },
+  "eq": {
+    "plugin": "http://lsp-plug.in/plugins/lv2/para_equalizer_x8_mono",
+    "control": {
+      "enabled": 1, "g_in": 1, "g_out": 1, "mode": 0,
+      "ft_0": 1, "fm_0": 0, "s_0": 0,
+      "f_0": 1000, "g_0": 0.2511886432, "q_0": 2,
+      "ft_1": 0, "ft_2": 0, "ft_3": 0, "ft_4": 0,
+      "ft_5": 0, "ft_6": 0, "ft_7": 0
+    }
+  },
+  "limiter": {
+    "plugin": "http://lsp-plug.in/plugins/lv2/limiter_mono",
+    "control": {
+      "enabled": 1, "g_in": 1, "g_out": 1, "alr": 0,
+      "th": 0.1, "boost": 0, "lk": 5, "at": 1, "rt": 5,
+      "ovs": 0, "dith": 0, "extsc": 0
+    }
+  }
+}

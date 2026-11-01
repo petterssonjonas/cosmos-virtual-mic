@@ -1,0 +1,546 @@
+// SPDX-License-Identifier: MPL-2.0
+
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+use cosmos_control::{Layout, LayoutKind, Node, Phase, Status};
+use pipewire as pw;
+use pw::proxy::{Listener, ProxyT};
+use pw::spa::param::{
+    ParamInfoFlags, ParamType,
+    audio::AudioInfoRaw,
+    format::{MediaSubtype, MediaType},
+    format_utils,
+};
+use pw::spa::utils::dict::DictRef;
+use pw::types::ObjectType;
+
+pub const MAX_NODES: usize = 256;
+const MAX_DEVICES: usize = 128;
+const MAX_PROPERTY_BYTES: usize = 512;
+const KEYS: &[&str] = &[
+    "node.name",
+    "node.description",
+    "node.nick",
+    "media.class",
+    "object.path",
+    "device.id",
+    "device.name",
+    "device.serial",
+    "device.bus-id",
+    "device.bus-path",
+    "device.api",
+    "api.alsa.path",
+    "api.alsa.pcm.card",
+    "api.alsa.pcm.device",
+    "api.alsa.pcm.subdevice",
+    "api.bluez5.address",
+    "api.bluez5.profile",
+    "audio.channels",
+    "audio.position",
+];
+const IDENTITY_KEYS: &[&str] = &[
+    "node.name",
+    "object.path",
+    "device.name",
+    "device.serial",
+    "device.bus-id",
+    "device.bus-path",
+    "device.api",
+    "api.alsa.path",
+    "api.alsa.pcm.device",
+    "api.alsa.pcm.subdevice",
+    "api.bluez5.address",
+    "api.bluez5.profile",
+];
+type Properties = BTreeMap<&'static str, String>;
+
+#[derive(Default)]
+struct Record {
+    properties: Properties,
+    current_layout: Option<Layout>,
+    available_layout: Option<Layout>,
+}
+
+impl Record {
+    fn update_param_flags(&mut self, parameter_type: ParamType, flags: ParamInfoFlags) {
+        if parameter_type == ParamType::Format && !flags.contains(ParamInfoFlags::READ) {
+            // Suspension can remove the readable format without emitting a null param.
+            self.current_layout = None;
+        }
+    }
+}
+
+pub struct Observed {
+    pub status: Status,
+    nodes: BTreeMap<u32, Record>,
+    devices: BTreeMap<u32, Properties>,
+    pub connection_error: Option<String>,
+}
+
+impl Observed {
+    pub fn new() -> Self {
+        Self {
+            status: Status {
+                pid: std::process::id(),
+                phase: Phase::Disconnected,
+                generation: 0,
+                last_error: None,
+                retry_ms: 0,
+                discovery_error: None,
+                last_control_error: None,
+            },
+            nodes: BTreeMap::new(),
+            devices: BTreeMap::new(),
+            connection_error: None,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.nodes.clear();
+        self.devices.clear();
+        self.connection_error = None;
+        self.status.discovery_error = None;
+    }
+
+    pub fn snapshot(&self) -> Vec<Node> {
+        if self.status.phase != Phase::Connected {
+            return Vec::new();
+        }
+        self.nodes
+            .iter()
+            .map(|(&id, record)| {
+                let properties = &record.properties;
+                let device = properties
+                    .get("device.id")
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .and_then(|id| self.devices.get(&id));
+                let identity = IDENTITY_KEYS
+                    .iter()
+                    .filter_map(|&key| {
+                        properties
+                            .get(key)
+                            .or_else(|| device.and_then(|device| device.get(key)))
+                            .map(|value| (key.to_owned(), value.clone()))
+                    })
+                    .collect();
+                let property_layout = property_layout(properties);
+                let layout = record
+                    .current_layout
+                    .as_ref()
+                    .or_else(|| {
+                        (property_layout.kind != LayoutKind::Unknown).then_some(&property_layout)
+                    })
+                    .or(record.available_layout.as_ref())
+                    .unwrap_or(&property_layout)
+                    .clone();
+                Node {
+                    id,
+                    generation: self.status.generation,
+                    name: properties.get("node.name").cloned().unwrap_or_default(),
+                    description: properties
+                        .get("node.description")
+                        .or_else(|| properties.get("node.nick"))
+                        .cloned()
+                        .unwrap_or_default(),
+                    media_class: properties.get("media.class").cloned().unwrap_or_default(),
+                    identity,
+                    layout,
+                }
+            })
+            .collect()
+    }
+}
+
+fn update(properties: &mut Properties, dictionary: &DictRef) -> bool {
+    let mut oversized = false;
+    for &key in KEYS {
+        if let Some(value) = dictionary.get(key) {
+            if value.len() > MAX_PROPERTY_BYTES {
+                properties.remove(key);
+                oversized = true;
+            } else {
+                properties.insert(key, value.to_owned());
+            }
+        }
+    }
+    oversized
+}
+
+fn property_layout(properties: &Properties) -> Layout {
+    let positions: Vec<String> = properties
+        .get("audio.position")
+        .map(|positions| {
+            positions
+                .split(|character: char| {
+                    character.is_whitespace() || matches!(character, '[' | ']' | ',' | '"')
+                })
+                .filter(|position| !position.is_empty())
+                .take(65)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let channels = properties
+        .get("audio.channels")
+        .and_then(|count| count.parse().ok())
+        .or_else(|| (!positions.is_empty()).then_some(positions.len() as u32));
+    Layout::new(channels, positions)
+}
+
+fn parameter_layout(parameter: &pw::spa::pod::Pod) -> Option<Layout> {
+    let (media_type, subtype) = format_utils::parse_format(parameter).ok()?;
+    if media_type != MediaType::Audio || subtype != MediaSubtype::Raw {
+        return Some(Layout {
+            kind: LayoutKind::Unsupported,
+            channels: None,
+            positions: vec![],
+        });
+    }
+    let mut info = AudioInfoRaw::new();
+    info.parse(parameter).ok()?;
+    let channels = info.channels();
+    if channels == 0 {
+        return None;
+    }
+    let positions = if channels as usize <= pw::spa::param::audio::MAX_CHANNELS
+        && !info
+            .flags()
+            .contains(pw::spa::param::audio::AudioInfoRawFlags::UNPOSITIONED)
+    {
+        info.position()[..channels as usize]
+            .iter()
+            .map(|&position| channel_name(position))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(Layout::new(Some(channels), positions))
+}
+
+fn channel_name(channel: u32) -> String {
+    let name = match channel {
+        pw::spa::sys::SPA_AUDIO_CHANNEL_MONO => "MONO",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_FL => "FL",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_FR => "FR",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_FC => "FC",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_LFE => "LFE",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_RL => "RL",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_RR => "RR",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_SL => "SL",
+        pw::spa::sys::SPA_AUDIO_CHANNEL_SR => "SR",
+        _ => return format!("SPA:{channel}"),
+    };
+    name.to_owned()
+}
+
+struct Binding {
+    // Listeners must unregister before the native proxy is destroyed.
+    _listener: Box<dyn Listener>,
+    _proxy: Box<dyn ProxyT>,
+}
+
+type Bindings = Rc<RefCell<BTreeMap<u32, Binding>>>;
+
+pub struct Connection {
+    // Drop callbacks first, then bound objects, registry, and finally the core.
+    _registry_listener: pw::registry::Listener,
+    _core_listener: pw::core::Listener,
+    _bindings: Bindings,
+    _registry: pw::registry::RegistryRc,
+    _core: pw::core::CoreRc,
+}
+
+impl Connection {
+    pub fn connect(
+        main_loop: &pw::main_loop::MainLoopRc,
+        remote: Option<&str>,
+        observed: &Rc<RefCell<Observed>>,
+    ) -> Result<Self, pw::Error> {
+        let context = pw::context::ContextRc::new(main_loop, None)?;
+        let mut properties = pw::properties::properties! {
+            "application.name" => "Cosmos Audio Mixer engine",
+            "application.id" => "cosmos-audio-mixer",
+        };
+        if let Some(remote) = remote {
+            properties.insert("remote.name", remote);
+        }
+        let core = context.connect_rc(Some(properties))?;
+        let generation = observed.borrow().status.generation;
+        let state = Rc::downgrade(observed);
+        let done_state = state.clone();
+        let core_listener = core
+            .add_listener_local()
+            .done(move |id, _sequence| {
+                if id == pw::core::PW_ID_CORE
+                    && let Some(state) = done_state.upgrade()
+                {
+                    let mut state = state.borrow_mut();
+                    if state.status.generation == generation
+                        && state.status.phase == Phase::Connecting
+                    {
+                        state.status.phase = Phase::Connected;
+                        state.status.last_error = None;
+                    }
+                }
+            })
+            .error(move |id, _sequence, result, message| {
+                if let Some(state) = state.upgrade() {
+                    let mut state = state.borrow_mut();
+                    if state.status.generation != generation {
+                        return;
+                    }
+                    let message: String = message.chars().take(512).collect();
+                    if id == pw::core::PW_ID_CORE {
+                        state.connection_error =
+                            Some(format!("PipeWire connection failed ({result}): {message}"));
+                    } else {
+                        state.status.discovery_error =
+                            Some(format!("PipeWire object {id} failed ({result}): {message}"));
+                    }
+                }
+            })
+            .register();
+        let registry = core.get_registry_rc()?;
+        let registry_weak = registry.downgrade();
+        let bindings: Bindings = Rc::new(RefCell::new(BTreeMap::new()));
+        let binding_weak = Rc::downgrade(&bindings);
+        let remove_bindings = binding_weak.clone();
+        let state = Rc::downgrade(observed);
+        let remove_state = state.clone();
+        let registry_listener = registry
+            .add_listener_local()
+            .global(move |global| {
+                let (Some(registry), Some(bindings), Some(state)) = (
+                    registry_weak.upgrade(),
+                    binding_weak.upgrade(),
+                    state.upgrade(),
+                ) else {
+                    return;
+                };
+                if state.borrow().status.generation != generation {
+                    return;
+                }
+                let id = global.id;
+                let binding = match global.type_ {
+                    ObjectType::Node => {
+                        let Some(properties) = global.props else {
+                            return;
+                        };
+                        let class = properties.get("media.class").unwrap_or("");
+                        if !class.starts_with("Audio/Source") && !class.starts_with("Audio/Sink") {
+                            return;
+                        }
+                        {
+                            let mut state = state.borrow_mut();
+                            if state.nodes.len() >= MAX_NODES && !state.nodes.contains_key(&id) {
+                                state.status.discovery_error =
+                                    Some(format!("discovery limited to {MAX_NODES} audio nodes"));
+                                return;
+                            }
+                            let mut record = Record::default();
+                            if update(&mut record.properties, properties) {
+                                state.status.discovery_error =
+                                    Some("oversized PipeWire property ignored".into());
+                            }
+                            state.nodes.insert(id, record);
+                        }
+                        let node: pw::node::Node = match registry.bind(global) {
+                            Ok(node) => node,
+                            Err(error) => {
+                                state.borrow_mut().status.discovery_error =
+                                    Some(format!("cannot inspect node {id}: {error}"));
+                                return;
+                            }
+                        };
+                        let info_state = Rc::downgrade(&state);
+                        let param_state = info_state.clone();
+                        let listener = node
+                            .add_listener_local()
+                            .info(move |info| {
+                                let Some(state) = info_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                let Some(record) = state.nodes.get_mut(&id) else {
+                                    return;
+                                };
+                                for parameter in info.params() {
+                                    record.update_param_flags(parameter.id(), parameter.flags());
+                                }
+                                if let Some(properties) = info.props()
+                                    && update(&mut record.properties, properties)
+                                {
+                                    state.status.discovery_error =
+                                        Some("oversized PipeWire property ignored".into());
+                                }
+                            })
+                            .param(move |_sequence, parameter_type, index, _next, parameter| {
+                                let Some(state) = param_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                let Some(record) = state.nodes.get_mut(&id) else {
+                                    return;
+                                };
+                                let layout = parameter.and_then(parameter_layout);
+                                if parameter_type == ParamType::Format {
+                                    record.current_layout = layout;
+                                } else if parameter_type == ParamType::EnumFormat {
+                                    if index == 0 {
+                                        record.available_layout = layout;
+                                    } else if layout != record.available_layout {
+                                        // Several advertised layouts are not an active mono/stereo configuration.
+                                        record.available_layout = Some(Layout::new(None, vec![]));
+                                    }
+                                }
+                            })
+                            .register();
+                        node.subscribe_params(&[ParamType::Format, ParamType::EnumFormat]);
+                        Binding {
+                            _listener: Box::new(listener),
+                            _proxy: Box::new(node),
+                        }
+                    }
+                    ObjectType::Device => {
+                        {
+                            let mut state = state.borrow_mut();
+                            if state.devices.len() >= MAX_DEVICES
+                                && !state.devices.contains_key(&id)
+                            {
+                                state.status.discovery_error =
+                                    Some(format!("discovery limited to {MAX_DEVICES} devices"));
+                                return;
+                            }
+                            let mut properties = Properties::new();
+                            if let Some(dictionary) = global.props {
+                                update(&mut properties, dictionary);
+                            }
+                            state.devices.insert(id, properties);
+                        }
+                        let device: pw::device::Device = match registry.bind(global) {
+                            Ok(device) => device,
+                            Err(error) => {
+                                state.borrow_mut().status.discovery_error =
+                                    Some(format!("cannot inspect device {id}: {error}"));
+                                return;
+                            }
+                        };
+                        let info_state = Rc::downgrade(&state);
+                        let listener = device
+                            .add_listener_local()
+                            .info(move |info| {
+                                let Some(state) = info_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                if let Some(properties) = state.devices.get_mut(&id)
+                                    && let Some(dictionary) = info.props()
+                                    && update(properties, dictionary)
+                                {
+                                    state.status.discovery_error =
+                                        Some("oversized PipeWire property ignored".into());
+                                }
+                            })
+                            .register();
+                        Binding {
+                            _listener: Box::new(listener),
+                            _proxy: Box::new(device),
+                        }
+                    }
+                    _ => return,
+                };
+                bindings.borrow_mut().insert(id, binding);
+            })
+            .global_remove(move |id| {
+                if let Some(bindings) = remove_bindings.upgrade() {
+                    bindings.borrow_mut().remove(&id);
+                }
+                if let Some(state) = remove_state.upgrade() {
+                    let mut state = state.borrow_mut();
+                    if state.status.generation == generation {
+                        state.nodes.remove(&id);
+                        state.devices.remove(&id);
+                    }
+                }
+            })
+            .register();
+        core.sync(0)?;
+        Ok(Self {
+            _registry_listener: registry_listener,
+            _core_listener: core_listener,
+            _bindings: bindings,
+            _registry: registry,
+            _core: core,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_clears_ids_and_device_properties() {
+        let mut state = Observed::new();
+        state.nodes.insert(17, Record::default());
+        state.devices.insert(2, Properties::new());
+        state.reset();
+        state.status.phase = Phase::Connected;
+        assert!(state.snapshot().is_empty());
+        assert!(state.devices.is_empty());
+    }
+
+    #[test]
+    fn unreadable_format_exposes_new_unsupported_layout_instead_of_stale_stereo() {
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        let mut record = Record {
+            current_layout: Some(Layout::new(Some(2), vec!["FL".into(), "FR".into()])),
+            ..Record::default()
+        };
+        record.properties.insert("audio.channels", "6".into());
+        record
+            .properties
+            .insert("audio.position", "[ FL FR FC LFE RL RR ]".into());
+        record.update_param_flags(ParamType::EnumFormat, ParamInfoFlags::WRITE);
+        record.update_param_flags(ParamType::Format, ParamInfoFlags::READ);
+        state.nodes.insert(17, record);
+        assert_eq!(state.snapshot()[0].layout.kind, LayoutKind::Stereo);
+
+        state
+            .nodes
+            .get_mut(&17)
+            .unwrap()
+            .update_param_flags(ParamType::Format, ParamInfoFlags::WRITE);
+        let nodes = state.snapshot();
+        assert_eq!(nodes[0].layout.channels, Some(6));
+        assert_eq!(nodes[0].layout.kind, LayoutKind::Unsupported);
+    }
+
+    #[test]
+    fn duplicate_descriptions_keep_distinct_identity_candidates() {
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        for (id, name) in [(1, "test.a"), (2, "test.b")] {
+            let mut record = Record::default();
+            record.properties.insert("node.name", name.into());
+            record
+                .properties
+                .insert("node.description", "same description".into());
+            state.nodes.insert(id, record);
+        }
+        let nodes = state.snapshot();
+        assert_ne!(nodes[0].identity, nodes[1].identity);
+    }
+}

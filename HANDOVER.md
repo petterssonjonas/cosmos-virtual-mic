@@ -2,26 +2,30 @@
 
 ## Resume here
 
-Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Work in `/home/jp/Projects/cosmos-audio-mixer`, inside the `cosmos` toolbox. Source `dev-env.sh` from Bash before Rust commands and before launching OMP.
+Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside the `cosmos` toolbox and source `dev-env.sh` before Rust commands. The main checkout is `/home/jp/Projects/cosmos-audio-mixer`. The backend implementation worktree is `/home/jp/Projects/.worktrees/cosmos-audio-mixer/backend-routing`, on `feature/backend-routing`. Start new work from `development`.
 
-Implementation has started. The workspace now has a native PipeWire discovery engine, an independent bounded local control interface, and real private LSP DSP validation. It is not yet a working mixer: application-owned DSP/routing, persistence, and the libcosmic frontend remain to be implemented. See the current implementation section below; the setup-session record remains as history.
+The Rust backend now hosts native LSP DSP, creates named playback/recording endpoints, reconciles explicit routes, provides real input/output levels, and persists validated profiles. It has passed private synthetic-audio and recovery checks. The libcosmic frontend is not implemented. Physical hardware, latency, clock drift, and long-running reliability remain separate validation work; do not claim release readiness.
 
 ## Current implementation — 2026-11-01
 
 - Verified all 24 native packages inside `cosmos`, Rust/Cargo 1.99.1, native PipeWire 1.6.11, LSP LV2 1.2.29 discovery, and filter-host runtime linkage.
-- With explicit owner permission, created local bootstrap commit `7c88940` from the existing project files, including the owner's `AGENTS.md` changes and `skills-lock.json`. Created `development` at that commit and switched to `feature/audio-engine`. No remote exists; no push or publication occurred. Implementation changes remain uncommitted.
-- Added `cosmos-control` and `cosmos-engine`, pinned PipeWire Rust bindings 0.10.1, and retained `Cargo.lock`. The engine exposes `run`, `status`, `list`, and `stop`. Clients do not own its process lifetime.
-- Native discovery reports identity candidates, explicit mono/stereo/unsupported/unknown layouts, connection generation, and disconnected/retry state. No microphone selection, links, endpoint creation, default changes, or application DSP is performed.
-- Private lifecycle smoke passed: server absent at start; three server restart/discovery cycles; stale-node removal; duplicate descriptions and unsupported channels; duplicate engine rejection; slow/oversized clients; crash recovery; explicit stop; preservation of ordinary files at the socket path.
-- Private synthetic-audio proof passed for real LSP gate, compressor, parametric EQ, limiter, and ordered chain. Missing mandatory plugins publish no bypass endpoint. Native-host recreation and two private-server restarts restore measured samples through explicit test orchestration. This is not engine-owned DSP recovery.
-- Measured representative steady-state ratios: open gate 1.0000, closed gate 0.000417, loud compressor 0.2195, EQ center 0.2512, limiter peak 0.099999 against a 0.1 ceiling. Final DSP logs, graphs, and samples are retained at `/tmp/cosmos-pw-kuey3e8t` for this session. Closed-gate checks reject zero-flow results; recovery checks verify both open and closed signals.
-- No live microphone capture, host service changes, default changes, or unrelated routing changes occurred. No Linuxmeeter source was used.
-- Final Rust checks passed: formatting, locked workspace build, all 13 tests, and locked all-target Clippy with warnings denied. The real lifecycle smoke and revised DSP harness passed.
-- Independent reviews identified recoverable IPC accept failures, stale negotiated layouts, and weaknesses in DSP assertions/configuration. These were corrected. Native filter logs no longer contain the malformed-module parser warning. Expected failure-injection diagnostics and a private-daemon legacy-access deprecation warning remain.
+- Preserved the owner's governance changes in bootstrap commit `7c88940`. With current-task authorization, squash-merged the reviewed discovery milestone into local `development` as `8c07f7c`, then created the backend worktree. No remote exists; no push, PR, or hosted CI was possible.
+- Replaced the product-specific exclusion in `AGENTS.md` with the general requirement to build independent application code. The original decision remains below as history.
+- `cosmos-control` now defines bounded profiles, effects, durable device selectors, routes, status, and the local client. `cosmos-engine` implements `run`, `status`, `list`, `profile`, `apply FILE`, and `stop`.
+- Each named mono/stereo bus has an input playback sink and output recording source. LSP gate/compressor/EQ/limiter instances run in the engine, not the desktop daemon. Parameters and mute change live without replacing endpoints; topology/channel changes can interrupt the affected bus.
+- Explicit routes recover when selected sources return. Missing, ambiguous, or unsupported sources produce controlled silence and an explicit state, never microphone substitution or downmix. Bus-to-bus routes and direct application playback are supported.
+- Hardware aliases, hide, enable, and mute are independent mixer-local settings. Defaults and unrelated graph objects are untouched.
+- Real input-feed/output peak and RMS snapshots use passive streams and allocation-free sample callbacks. Native LV2 output-control meters are not exported by filter-chain; no exact gate-open or gain-reduction claim is made. Input metering follows actual incoming links rather than the ineffective native sink-monitor tap.
+- Profiles are bounded, versioned, validated before mutation, atomically saved, and protected by a separate writer lock. Invalid originals are preserved during explicit recovery. Interrupted backup and exact-size boundaries have regression coverage.
+- Final checks passed: formatting, locked workspace build, all 37 Rust tests, Clippy with warnings denied, and all three private lifecycle/audio harnesses.
+- `tests/backend-audio.py --keep` passed mono/stereo full-chain samples, live threshold/endpoint stability, 44.1 kHz conversion, source loss/return, ambiguity, six-channel rejection, mute/hide distinctions, meter recreation, multiple-source meter continuity, unrelated-bus isolation, named buses, engine crash/restart, two server restarts, missing-plugin recovery, large IPC, invalid-profile rejection, and corrupt-profile preservation. Final evidence is at `/var/tmp/cosmos-backend-jgordl2u`; standalone DSP evidence is at `/tmp/cosmos-pw-f5uso86y`.
+- A teardown regression exposed incorrect native error classification. Only core `-EPIPE` now resets the connection; other resource errors remain visible and trigger reconciliation. Links are removed before endpoint owners. The private harness confirmed that normal source removal and topology changes keep the connection generation unchanged.
+- Independent persistence, realtime-meter, and native-routing reviews found no remaining blockers after fixes. The standalone private DSP harness remains useful for plugin/host diagnostics; the backend harness tests the actual Rust application.
+- No live microphone capture, host service changes, default changes, or unrelated routing changes occurred. No rejected mixer source was used.
 
-Next implementation work: integrate supported DSP and app-owned endpoints into the Rust engine with validated desired state, safe failure/recovery, and live controls; then complete routing/configuration and the native libcosmic UI. Keep the original reliability matrix as the completion requirement. The standalone test filter host is evidence for the hosting choice, not a substitute application backend.
+Next product work: build the libcosmic frontend against the working backend contract. Keep the original reliability matrix as the release requirement. Physical hotplug/Bluetooth, independent-clock hardware, latency, long soak tests, and actual GUI responsiveness still need evidence and, where disruptive, explicit owner permission.
 
-`DEVELOPMENT.md` contains commands, current lifecycle invariants, verification boundaries, and the native recorder exit-status detail. Full hardware/UI reliability and a distribution licence audit remain open.
+`DEVELOPMENT.md` contains commands, profile semantics, lifecycle invariants, and verification boundaries. A complete dependency licence/source/notice audit remains required before distribution.
 
 ## User intent and scope
 

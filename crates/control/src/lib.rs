@@ -11,10 +11,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod model;
 pub mod socket;
+pub use model::{
+    BackendStatus, Bus, BusStatus, Channels, DeviceSettings, Effect, EffectInstance, MeterSnapshot,
+    NodeRef, Profile, Route, RouteStatus, RuntimeState,
+};
 
 pub const VERSION: u32 = 1;
-pub const MAX_REQUEST_BYTES: usize = 4096;
+pub const MAX_REQUEST_BYTES: usize = model::MAX_PROFILE_BYTES + 4096;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -24,6 +29,8 @@ pub enum Command {
     Status,
     List,
     Stop,
+    GetProfile,
+    Apply,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -31,6 +38,8 @@ pub enum Command {
 pub struct Request {
     pub version: u32,
     pub command: Command,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Profile>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -52,6 +61,9 @@ pub struct Status {
     pub discovery_error: Option<String>,
     /// Most recent recoverable IPC failure; retained without an unbounded event/log queue.
     pub last_control_error: Option<String>,
+    pub backend: BackendStatus,
+    /// Recoverable configuration error. Defaults are never written over unreadable data.
+    pub config_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -113,6 +125,15 @@ pub enum Response {
         version: u32,
         stopping: bool,
     },
+    Profile {
+        version: u32,
+        profile: Profile,
+    },
+    Applied {
+        version: u32,
+        accepted: bool,
+        status: Status,
+    },
     Error {
         version: u32,
         error: String,
@@ -143,9 +164,18 @@ pub fn frame(bytes: &[u8], limit: usize) -> io::Result<Option<&[u8]>> {
 }
 
 pub fn decode_request(bytes: &[u8]) -> io::Result<Request> {
+    if bytes.len() > MAX_REQUEST_BYTES {
+        return Err(invalid("request exceeds control message limit"));
+    }
     let request: Request = serde_json::from_slice(bytes).map_err(invalid_json)?;
     if request.version != VERSION {
         return Err(invalid("unsupported control protocol version"));
+    }
+    match (&request.command, &request.profile) {
+        (Command::Apply, Some(profile)) => profile.validate()?,
+        (Command::Apply, None) => return Err(invalid("apply requires a profile")),
+        (_, Some(_)) => return Err(invalid("profile is valid only for apply")),
+        _ => {}
     }
     Ok(request)
 }
@@ -291,18 +321,36 @@ fn connect(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
 
 /// Connect, write and read against one absolute deadline (a slow peer cannot extend it).
 pub fn request(path: &Path, command: Command) -> io::Result<Response> {
+    send_request(
+        path,
+        Request {
+            version: VERSION,
+            command,
+            profile: None,
+        },
+    )
+}
+
+pub fn apply(path: &Path, profile: Profile) -> io::Result<Response> {
+    profile.validate()?;
+    send_request(
+        path,
+        Request {
+            version: VERSION,
+            command: Command::Apply,
+            profile: Some(profile),
+        },
+    )
+}
+
+fn send_request(path: &Path, request: Request) -> io::Result<Response> {
+    let message = encode(&request, MAX_REQUEST_BYTES)?;
+    decode_request(&message[..message.len() - 1])?;
     socket::validate_parent(path)?;
     socket::validate_socket(path)?;
     let deadline = Instant::now() + CLIENT_TIMEOUT;
     let mut stream = connect(path, deadline)?;
     check_peer(&stream)?;
-    let message = encode(
-        &Request {
-            version: VERSION,
-            command,
-        },
-        MAX_REQUEST_BYTES,
-    )?;
     let mut remaining = message.as_slice();
     while !remaining.is_empty() {
         wait_fd(&stream, libc::POLLOUT, deadline)?;
@@ -343,6 +391,8 @@ pub fn request(path: &Path, command: Command) -> io::Result<Response> {
                     let version = match &value {
                         Response::Snapshot { version, .. }
                         | Response::Stopping { version, .. }
+                        | Response::Profile { version, .. }
+                        | Response::Applied { version, .. }
                         | Response::Error { version, .. } => *version,
                     };
                     if version != VERSION {
@@ -379,9 +429,25 @@ mod tests {
             br#"{"version":2,"command":"stop"}"#.as_slice(),
             br#"{"version":1,"command":"route"}"#.as_slice(),
             br#"{"version":1,"command":"stop","extra":1}"#.as_slice(),
+            br#"{"version":1,"command":"apply"}"#.as_slice(),
+            br#"{"version":1,"command":"status","profile":{"version":1,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
+            br#"{"version":1,"command":"apply","profile":{"version":2,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
         ] {
             assert!(decode_request(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn apply_accepts_only_validated_profiles_and_profile_query_is_separate() {
+        let apply = decode_request(br#"{"version":1,"command":"apply","profile":{"version":1,"buses":[],"devices":[],"routes":[]}}"#).unwrap();
+        assert_eq!(apply.command, Command::Apply);
+        assert_eq!(apply.profile.unwrap(), Profile::default());
+        assert_eq!(
+            decode_request(br#"{"version":1,"command":"get_profile"}"#)
+                .unwrap()
+                .command,
+            Command::GetProfile
+        );
     }
 
     #[test]

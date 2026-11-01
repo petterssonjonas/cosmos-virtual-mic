@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod discovery;
+mod meter;
+mod persistence;
+mod runtime;
 mod server;
 
 use std::cell::{Cell, RefCell};
@@ -20,18 +23,20 @@ const TICK: Duration = Duration::from_millis(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(2);
-const USAGE: &str = "Cosmos Audio Mixer discovery engine\n\
-Usage: cosmos-engine run [--socket PATH] [--remote NAME]\n\
-       cosmos-engine status|list|stop [--socket PATH]\n\
-run stays in the foreground; start it as a separate process to keep it independent\n\
-of clients. Closing a client does not stop the engine. Only discovery is implemented;\n\
-no links, defaults, streams, routing, or DSP are created.\n";
+const USAGE: &str = "Cosmos Audio Mixer engine\n\
+Usage: cosmos-engine run [--socket PATH] [--remote NAME] [--config PATH]\n\
+       cosmos-engine status|list|profile|stop [--socket PATH]\n\
+       cosmos-engine apply FILE [--socket PATH]\n\
+run stays in the foreground, independent of control clients. Profiles are explicit:\n\
+empty defaults create no endpoints or routes and never capture audio.\n";
 
 struct Options {
     command: String,
     socket: PathBuf,
     create_parent: bool,
     remote: Option<String>,
+    config: Option<PathBuf>,
+    import: Option<PathBuf>,
 }
 
 fn next_value(arguments: &mut impl Iterator<Item = OsString>, flag: &str) -> io::Result<OsString> {
@@ -52,13 +57,18 @@ fn options() -> io::Result<Option<Options>> {
     let command = command
         .into_string()
         .map_err(|_| control::invalid("command must be UTF-8"))?;
-    if !matches!(command.as_str(), "run" | "status" | "list" | "stop") {
+    if !matches!(
+        command.as_str(),
+        "run" | "status" | "list" | "profile" | "apply" | "stop"
+    ) {
         return Err(control::invalid(format!(
             "unknown command: {command}\n{USAGE}"
         )));
     }
     let mut socket = None;
     let mut remote = None;
+    let mut config = None;
+    let mut import = None;
     while let Some(argument) = arguments.next() {
         if argument == "--socket" && socket.is_none() {
             socket = Some(PathBuf::from(next_value(&mut arguments, "--socket")?));
@@ -68,6 +78,13 @@ fn options() -> io::Result<Option<Options>> {
                     .into_string()
                     .map_err(|_| control::invalid("remote name must be UTF-8"))?,
             );
+        } else if argument == "--config" && config.is_none() && command == "run" {
+            config = Some(PathBuf::from(next_value(&mut arguments, "--config")?));
+        } else if command == "apply"
+            && import.is_none()
+            && !argument.as_encoded_bytes().starts_with(b"--")
+        {
+            import = Some(PathBuf::from(argument));
         } else {
             return Err(control::invalid(format!(
                 "unexpected option: {}",
@@ -89,6 +106,12 @@ fn options() -> io::Result<Option<Options>> {
             "remote name must be nonempty, at most 512 bytes, and contain no NUL",
         ));
     }
+    if command == "apply" && import.is_none() {
+        return Err(control::invalid("apply requires a profile FILE"));
+    }
+    if command == "run" && config.is_none() {
+        config = Some(persistence::default_path()?);
+    }
     let create_parent = socket.is_none();
     Ok(Some(Options {
         command,
@@ -98,6 +121,8 @@ fn options() -> io::Result<Option<Options>> {
         },
         create_parent,
         remote,
+        config,
+        import,
     }))
 }
 
@@ -123,6 +148,13 @@ fn run(options: Options) -> io::Result<()> {
         .loop_()
         .add_signal_local(pw::loop_::Signal::TERM, move || quit_term.set(true));
     let observed = Rc::new(RefCell::new(Observed::new()));
+    let mut store = persistence::Store::load(
+        options
+            .config
+            .ok_or_else(|| control::invalid("run requires a config path"))?,
+    );
+    observed.borrow_mut().status.config_error = store.error.clone();
+    let mut runtime = runtime::Runtime::new(&main_loop, options.remote.as_deref());
     let mut connection = None;
     let mut connected_at = Instant::now();
     let mut next_attempt = Instant::now();
@@ -183,11 +215,16 @@ fn run(options: Options) -> io::Result<()> {
             } else {
                 0
             };
-            if !server.tick(&mut observed)? {
+            observed.status.backend =
+                runtime.reconcile(&store.profile, connection.as_ref(), &observed);
+            if !server.tick(&mut observed, &mut store, |profile, observed| {
+                runtime.reconcile(profile, connection.as_ref(), observed)
+            })? {
                 break;
             }
         }
     }
+    drop(runtime);
     drop(connection);
     Ok(())
 }
@@ -199,13 +236,21 @@ fn execute() -> io::Result<()> {
     if options.command == "run" {
         return run(options);
     }
-    let command = match options.command.as_str() {
-        "status" => Command::Status,
-        "list" => Command::List,
-        "stop" => Command::Stop,
-        _ => return Err(control::invalid("invalid client command")),
+    let response = if options.command == "apply" {
+        let path = options
+            .import
+            .ok_or_else(|| control::invalid("apply requires a profile FILE"))?;
+        control::apply(&options.socket, persistence::read_profile(&path)?)?
+    } else {
+        let command = match options.command.as_str() {
+            "status" => Command::Status,
+            "list" => Command::List,
+            "profile" => Command::GetProfile,
+            "stop" => Command::Stop,
+            _ => return Err(control::invalid("invalid client command")),
+        };
+        control::request(&options.socket, command)?
     };
-    let response = control::request(&options.socket, command)?;
     if let Response::Error { error, .. } = &response {
         return Err(io::Error::other(error.clone()));
     }

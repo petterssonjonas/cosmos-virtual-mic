@@ -178,7 +178,7 @@ def main():
                     oversized.settimeout(3)
                     oversized.connect(str(ipc))
                     try:
-                        oversized.sendall(b"x" * 65536 + b"\n")
+                        oversized.sendall(b"x" * (128 * 1024) + b"\n")
                         oversized.recv(4096)
                     except (BrokenPipeError, ConnectionResetError):
                         pass

@@ -116,29 +116,69 @@ Verified on 2026-11-01 with PipeWire 1.6.11 and LSP 1.2.29:
 
 PipeWire 1.6.11 `pw-cat` returns status 1 when finite recording reaches its sample limit. The harness checks that specific native result, empty recorder diagnostics, exact sample count, finite values, and DSP outcomes. It does not accept arbitrary failures.
 
-This proves native DSP feasibility, not application-owned DSP recovery. Live parameter changes, stereo DSP, device loss, multi-clock hardware, latency, UI behavior, and the full handover acceptance matrix remain unverified.
+This standalone harness proves native DSP behavior. The separate backend harness below verifies engine-owned hosting, controls, routing, persistence, and recovery. Neither harness proves physical device behavior, clock drift, latency, UI behavior, or the full release acceptance matrix.
 
-## Discovery engine and control client
+## Backend and control client
 
-The workspace contains `cosmos-control` (toolkit-independent protocol/client) and `cosmos-engine` (native PipeWire discovery and control server). Build after sourcing `dev-env.sh`:
+The workspace contains `cosmos-control` (toolkit-independent protocol, profile model, and client) and `cosmos-engine` (native discovery, DSP hosting, routing, metering, and persistence). Build after sourcing `dev-env.sh`:
 
 ```sh
 cargo build --workspace --locked
 ./target/debug/cosmos-engine --help
 ./tests/engine-lifecycle.py
+./tests/backend-audio.py --keep
 ```
 
 The lifecycle test uses a private server and three synthetic nodes. It does not connect to desktop audio. It checks server absence, mono/stereo/unsupported layouts, duplicate descriptions, three server restarts, stale-node removal, duplicate engine rejection, slow/oversized clients, crash recovery, and explicit stop. It also checks that existing user files survive and that non-private socket directories are rejected.
 
-The executable accepts `run [--socket PATH] [--remote NAME]` and `status|list|stop [--socket PATH]`. `run` stays in the foreground; launch it as a separate process when needed. Closing a control client does not stop it. Login startup is not installed or enabled. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, `run` connects read-only to the default PipeWire server; automated checks always override the remote and runtime directory.
+The executable accepts `run [--socket PATH] [--remote NAME] [--config PATH]`, `status|list|profile|stop [--socket PATH]`, and `apply FILE [--socket PATH]`. `run` stays in the foreground; launch it as a separate process when needed. Closing a control client does not stop it. Login startup is not installed or enabled. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, `run` connects to the default PipeWire server and restores the saved profile. An empty profile creates no audio path. Automated checks always use a private remote, runtime, HOME, and configuration.
 
 Lifecycle invariants:
 
 - Only the engine that holds the persistent socket lock can own the control endpoint. A stale socket can be reclaimed after a crash; ordinary files and symlinks are not replaced.
 - Socket parents must be private and user-owned. Ancestors must be root/user-owned, with write access restricted unless sticky. Toolbox maps `/tmp` ownership to UID 65534 here; lifecycle tests use `/var/tmp` rather than weaken these checks.
 - Every connection attempt has a new generation. Disconnect removes observed nodes and devices. Numeric IDs are valid only in that generation and are not durable device selection keys.
+- Only a core `-EPIPE` error marks a lost native connection. Other native resource errors remain visible as bounded diagnostics and trigger graph reconciliation. Route and meter links are removed before their endpoint owners; ordinary graph changes do not reset unrelated buses.
 - Reconnect delay grows from 250 ms to at most 2 s. Handshake timeout is 2 s. Control requests remain available while PipeWire is absent.
-- IPC accepts at most eight active clients, 4 KiB requests, and 2 MiB responses. Server requests have a 1 s deadline; client operations have a 2 s absolute deadline. Stop has a bounded acknowledgement period.
-- Discovery reports identity candidates and channel semantics. It does not select a microphone, remap channels, create routes/endpoints, load DSP, or change defaults.
+- IPC accepts at most eight active clients, 68 KiB requests, and 2 MiB responses. Complete serialized profiles are limited to 64 KiB. Server requests have a 1 s deadline; client operations have a 2 s absolute deadline. Stop has a bounded acknowledgement period.
+- Discovery reports identity candidates and channel semantics. Routing uses explicit selectors, never defaults or saved numeric IDs. Missing or ambiguous sources and unsupported layouts produce an error/unavailable state, not another microphone or a downmix.
 
 The locked dependency metadata contains 65 packages, including the two local crates. All external sources are crates.io registry packages; all have licence declarations. This metadata inspection is not a full licence/source/notice audit and does not authorize distribution. libcosmic is not yet a resolved dependency.
+
+### Profiles and processing
+
+`profile` returns the desired profile. `apply FILE` validates the complete replacement before saving or changing the graph. Acceptance means the desired state was saved; it does not mean that hardware, plugins, or links are ready. Check `status.backend` for bus and route states and `status.config_error` for persistence errors.
+
+The version-1 profile contains `buses`, `devices`, and `routes`. See `crates/control/src/model.rs` for the strict schema and bounds, and `tests/backend-audio.py` for runnable synthetic examples.
+
+- Each bus has an independent ID/name, explicit `mono` or `stereo` channels, enable/hidden/mute flags, and an ordered list of effect instances.
+- Each bus publishes `cosmos.bus.<id>.input` as a playback sink and `cosmos.bus.<id>.output` as a recording source. No system defaults change. Applications can use the input directly, or receive explicit engine-owned routes.
+- Supported effects are gate, compressor, one parametric EQ band per instance, and limiter. Multiple EQ instances form a multi-band chain. Gate controls include threshold, attack, hold, and release. Parameters use explicit dB, Hz, and milliseconds and must fit the installed native plugin ranges.
+- Parameter changes and mute use native live controls and retain endpoint identity. Effect topology/channel changes safely replace the affected bus and can interrupt its clients. Endpoint logical names remain stable.
+- Device selectors use the identity properties from discovery. Device aliases, visibility, enable state, and mute stay local to this mixer. Hiding does not mute or disable. Hardware names, profiles, volume, and availability outside the mixer are not changed.
+- Routes connect selected hardware/application nodes and named buses. Validation rejects feedback and overlapping selector cycles before persistence. Resolved graph validation rejects identity aliases that would create a cycle.
+- Plugins run in the engine process, not the desktop PipeWire daemon. Native plugin failure can still terminate that engine process. No raw-audio fallback is created when required processing fails.
+- Input-feed and output meters report real per-channel linear peak/RMS values, sample counts, and freshness. They use bounded replaceable snapshots, not an event queue. Input metering follows actual incoming links; it does not rely on the native sink-monitor path. These values are not an exact LV2 gate-open or gain-reduction signal.
+
+### Persistence
+
+The default profile is `$XDG_CONFIG_HOME/cosmos-audio-mixer/profile.json`, or `$HOME/.config/cosmos-audio-mixer/profile.json` when the XDG variable is absent. Use `--config` for an explicit private path. The directory must be private and user-owned; stored files are mode 0600. A separate persistent lock prevents two engines from writing the same profile.
+
+Saving writes and syncs a private temporary file, atomically replaces the profile, and syncs its directory. Corrupt or unsupported profiles are reported and are not silently overwritten. Explicit Apply preserves the invalid original with a no-replace backup rename before replacement. An interrupted backup leaves the original recoverable; a later Apply can complete recovery. A directory-sync error after replacement is reported separately because the new desired state was already accepted.
+
+### Backend verification
+
+`./tests/backend-audio.py --keep` exercises the Rust executable, not a substitute filter host. It records synthetic samples and retains logs, graph snapshots, status, profiles, and audio files in the printed private directory.
+
+Verified paths include:
+
+- Apply while the server is absent; large bounded profile transfer; rejection of invalid parameters and feedback without changing saved state.
+- Real gate and ordered gate/compressor/EQ/limiter processing in mono and stereo; live thresholds; 44.1 kHz input into the 48 kHz graph.
+- Real input/output meters, recovery after removal of a meter node, and continued input metering when one of two sources leaves.
+- Source disappearance/return, ambiguous identity, unsupported six-channel input, and no unrelated-source substitution. Unavailable output is silent.
+- Direct application playback, named bus-to-bus routing, independent hide/mute/enable behavior, and continued audio on an unrelated bus when another route fails.
+- An unchanged connection generation across source removal, meter removal, and bus topology changes while the private server remains running.
+- Engine crash/restart and two private PipeWire restarts with automatic restoration from saved state.
+- Missing native plugins with no bypass endpoints, plugin restoration, and corrupt-profile preservation/recovery.
+
+Physical microphone hotplug, Bluetooth transitions, independent hardware clocks, end-to-end latency, long-running resource growth, and frontend responsiveness still require separate authorized validation. The private tests do not capture a live microphone or change desktop audio.

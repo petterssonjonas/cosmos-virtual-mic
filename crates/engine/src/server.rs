@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 
 use control::socket::OwnedSocket;
 use cosmos_control::{
-    self as control, Command, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Response, VERSION,
+    self as control, BackendStatus, Command, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, Profile,
+    Response, VERSION,
 };
 
 use crate::discovery::Observed;
+use crate::persistence::Store;
 
 const MAX_CLIENTS: usize = 8;
 const MAX_ACCEPTS_PER_TICK: usize = 16;
@@ -72,12 +74,18 @@ impl Client {
         })
     }
 
-    fn poll(&mut self, observed: &Observed, now: Instant) -> io::Result<bool> {
+    fn poll(
+        &mut self,
+        observed: &mut Observed,
+        store: &mut Store,
+        reconcile: &mut impl FnMut(&Profile, &Observed) -> BackendStatus,
+        now: Instant,
+    ) -> io::Result<bool> {
         if now >= self.deadline {
             return Ok(false);
         }
         if self.output.is_none() {
-            let mut buffer = [0; 1024];
+            let mut buffer = [0; 8192];
             match self.stream.read(&mut buffer) {
                 Ok(0) => return Ok(false),
                 Ok(length) => {
@@ -95,6 +103,43 @@ impl Client {
                                         Response::Stopping {
                                             version: VERSION,
                                             stopping: true,
+                                        }
+                                    }
+                                    Command::GetProfile => Response::Profile {
+                                        version: VERSION,
+                                        profile: store.profile.clone(),
+                                    },
+                                    Command::Apply => {
+                                        let profile = request.profile.ok_or_else(|| {
+                                            control::invalid("apply requires a profile")
+                                        })?;
+                                        let validation =
+                                            if observed.status.phase == control::Phase::Connected {
+                                                crate::runtime::validate_observed_profile(
+                                                    &profile, observed,
+                                                )
+                                                .map_err(control::invalid)
+                                            } else {
+                                                Ok(())
+                                            };
+                                        match validation.and_then(|()| store.apply(profile)) {
+                                            Ok(()) => {
+                                                observed.status.config_error = store.error.clone();
+                                                observed.status.backend =
+                                                    reconcile(&store.profile, observed);
+                                                Response::Applied {
+                                                    version: VERSION,
+                                                    accepted: true,
+                                                    status: observed.status.clone(),
+                                                }
+                                            }
+                                            Err(error) => {
+                                                observed.status.config_error = store.error.clone();
+                                                Response::Error {
+                                                    version: VERSION,
+                                                    error: error.to_string(),
+                                                }
+                                            }
                                         }
                                     }
                                     command => Response::Snapshot {
@@ -160,7 +205,12 @@ impl Server {
     }
 
     /// All sockets are nonblocking. Each tick has fixed accept, read, and write bounds.
-    pub fn tick(&mut self, observed: &mut Observed) -> io::Result<bool> {
+    pub fn tick(
+        &mut self,
+        observed: &mut Observed,
+        store: &mut Store,
+        mut reconcile: impl FnMut(&Profile, &Observed) -> BackendStatus,
+    ) -> io::Result<bool> {
         let now = Instant::now();
         if self.stopping_at.is_none() {
             for _ in 0..MAX_ACCEPTS_PER_TICK {
@@ -203,7 +253,9 @@ impl Server {
         let mut received_stop = false;
         self.clients.retain_mut(|client| {
             // One failed/disconnected client must not stop the engine or other clients.
-            let keep = client.poll(observed, now).unwrap_or(false);
+            let keep = client
+                .poll(observed, store, &mut reconcile, now)
+                .unwrap_or(false);
             received_stop |= client.stopping;
             keep
         });

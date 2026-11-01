@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use cosmos_control::{Layout, LayoutKind, Node, Phase, Status};
+use cosmos_control::{BackendStatus, Layout, LayoutKind, Node, Phase, Status};
 use pipewire as pw;
 use pw::proxy::{Listener, ProxyT};
 use pw::spa::param::{
@@ -19,6 +19,8 @@ use pw::types::ObjectType;
 pub const MAX_NODES: usize = 256;
 const MAX_DEVICES: usize = 128;
 const MAX_PROPERTY_BYTES: usize = 512;
+const MAX_PORTS: usize = 2048;
+const MAX_LINKS: usize = 2048;
 const KEYS: &[&str] = &[
     "node.name",
     "node.description",
@@ -39,6 +41,8 @@ const KEYS: &[&str] = &[
     "api.bluez5.profile",
     "audio.channels",
     "audio.position",
+    "cosmos.owner",
+    "cosmos.bus.id",
 ];
 const IDENTITY_KEYS: &[&str] = &[
     "node.name",
@@ -72,10 +76,29 @@ impl Record {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Port {
+    pub id: u32,
+    pub node_id: u32,
+    pub output: bool,
+    pub channel: String,
+    pub monitor: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphLink {
+    pub output_port: u32,
+    pub input_port: u32,
+    pub owned: bool,
+}
+
 pub struct Observed {
     pub status: Status,
     nodes: BTreeMap<u32, Record>,
     devices: BTreeMap<u32, Properties>,
+    pub ports: BTreeMap<u32, Port>,
+    pub links: BTreeMap<u32, GraphLink>,
+    pub graph_revision: u64,
     pub connection_error: Option<String>,
 }
 
@@ -90,9 +113,14 @@ impl Observed {
                 retry_ms: 0,
                 discovery_error: None,
                 last_control_error: None,
+                backend: BackendStatus::default(),
+                config_error: None,
             },
             nodes: BTreeMap::new(),
             devices: BTreeMap::new(),
+            ports: BTreeMap::new(),
+            links: BTreeMap::new(),
+            graph_revision: 0,
             connection_error: None,
         }
     }
@@ -100,6 +128,9 @@ impl Observed {
     pub fn reset(&mut self) {
         self.nodes.clear();
         self.devices.clear();
+        self.ports.clear();
+        self.links.clear();
+        self.graph_revision = self.graph_revision.wrapping_add(1);
         self.connection_error = None;
         self.status.discovery_error = None;
     }
@@ -150,6 +181,29 @@ impl Observed {
                 }
             })
             .collect()
+    }
+
+    pub fn is_owned(&self, id: u32) -> bool {
+        self.nodes.get(&id).is_some_and(|record| {
+            record
+                .properties
+                .get("cosmos.owner")
+                .is_some_and(|owner| owner == "cosmos-audio-mixer")
+        })
+    }
+
+    fn core_error(&mut self, id: u32, result: i32, message: &str) {
+        let message: String = message.chars().take(512).collect();
+        // Native filter-chain treats only core EPIPE as connection loss. A core
+        // ENOENT can be a raced resource destroy while the transport stays alive.
+        if id == pw::core::PW_ID_CORE && result == -libc::EPIPE {
+            self.connection_error =
+                Some(format!("PipeWire connection failed ({result}): {message}"));
+        } else {
+            self.status.discovery_error =
+                Some(format!("PipeWire object {id} failed ({result}): {message}"));
+            self.graph_revision = self.graph_revision.wrapping_add(1);
+        }
     }
 }
 
@@ -238,7 +292,12 @@ fn channel_name(channel: u32) -> String {
 struct Binding {
     // Listeners must unregister before the native proxy is destroyed.
     _listener: Box<dyn Listener>,
-    _proxy: Box<dyn ProxyT>,
+    object: BoundObject,
+}
+
+enum BoundObject {
+    Node(pw::node::Node),
+    Other { _proxy: Box<dyn ProxyT> },
 }
 
 type Bindings = Rc<RefCell<BTreeMap<u32, Binding>>>;
@@ -250,9 +309,32 @@ pub struct Connection {
     _bindings: Bindings,
     _registry: pw::registry::RegistryRc,
     _core: pw::core::CoreRc,
+    context: pw::context::ContextRc,
 }
 
 impl Connection {
+    pub fn core(&self) -> &pw::core::CoreRc {
+        &self._core
+    }
+
+    pub fn context(&self) -> &pw::context::ContextRc {
+        &self.context
+    }
+
+    pub fn set_node_param(&self, id: u32, parameter: &pw::spa::pod::Pod) -> bool {
+        let bindings = self._bindings.borrow();
+        if let Some(Binding {
+            object: BoundObject::Node(node),
+            ..
+        }) = bindings.get(&id)
+        {
+            node.set_param(ParamType::Props, 0, parameter);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn connect(
         main_loop: &pw::main_loop::MainLoopRc,
         remote: Option<&str>,
@@ -291,14 +373,7 @@ impl Connection {
                     if state.status.generation != generation {
                         return;
                     }
-                    let message: String = message.chars().take(512).collect();
-                    if id == pw::core::PW_ID_CORE {
-                        state.connection_error =
-                            Some(format!("PipeWire connection failed ({result}): {message}"));
-                    } else {
-                        state.status.discovery_error =
-                            Some(format!("PipeWire object {id} failed ({result}): {message}"));
-                    }
+                    state.core_error(id, result, message);
                 }
             })
             .register();
@@ -329,7 +404,11 @@ impl Connection {
                             return;
                         };
                         let class = properties.get("media.class").unwrap_or("");
-                        if !class.starts_with("Audio/Source") && !class.starts_with("Audio/Sink") {
+                        if !class.starts_with("Audio/Source")
+                            && !class.starts_with("Audio/Sink")
+                            && class != "Stream/Output/Audio"
+                            && class != "Stream/Input/Audio"
+                        {
                             return;
                         }
                         {
@@ -345,6 +424,7 @@ impl Connection {
                                     Some("oversized PipeWire property ignored".into());
                             }
                             state.nodes.insert(id, record);
+                            state.graph_revision = state.graph_revision.wrapping_add(1);
                         }
                         let node: pw::node::Node = match registry.bind(global) {
                             Ok(node) => node,
@@ -366,6 +446,7 @@ impl Connection {
                                 if state.status.generation != generation {
                                     return;
                                 }
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
                                 let Some(record) = state.nodes.get_mut(&id) else {
                                     return;
                                 };
@@ -387,6 +468,7 @@ impl Connection {
                                 if state.status.generation != generation {
                                     return;
                                 }
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
                                 let Some(record) = state.nodes.get_mut(&id) else {
                                     return;
                                 };
@@ -406,7 +488,7 @@ impl Connection {
                         node.subscribe_params(&[ParamType::Format, ParamType::EnumFormat]);
                         Binding {
                             _listener: Box::new(listener),
-                            _proxy: Box::new(node),
+                            object: BoundObject::Node(node),
                         }
                     }
                     ObjectType::Device => {
@@ -444,6 +526,7 @@ impl Connection {
                                 if state.status.generation != generation {
                                     return;
                                 }
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
                                 if let Some(properties) = state.devices.get_mut(&id)
                                     && let Some(dictionary) = info.props()
                                     && update(properties, dictionary)
@@ -455,7 +538,119 @@ impl Connection {
                             .register();
                         Binding {
                             _listener: Box::new(listener),
-                            _proxy: Box::new(device),
+                            object: BoundObject::Other {
+                                _proxy: Box::new(device),
+                            },
+                        }
+                    }
+                    ObjectType::Port => {
+                        let Some(properties) = global.props else {
+                            return;
+                        };
+                        let Some(node_id) =
+                            properties.get("node.id").and_then(|id| id.parse().ok())
+                        else {
+                            return;
+                        };
+                        {
+                            let mut state = state.borrow_mut();
+                            if state.ports.len() >= MAX_PORTS {
+                                state.status.discovery_error =
+                                    Some(format!("discovery limited to {MAX_PORTS} ports"));
+                                return;
+                            }
+                            state.ports.insert(
+                                id,
+                                Port {
+                                    id,
+                                    node_id,
+                                    output: properties.get("port.direction") == Some("out"),
+                                    channel: properties
+                                        .get("audio.channel")
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    monitor: properties.get("port.monitor") == Some("true"),
+                                },
+                            );
+                            state.graph_revision = state.graph_revision.wrapping_add(1);
+                        }
+                        let port: pw::port::Port = match registry.bind(global) {
+                            Ok(port) => port,
+                            Err(error) => {
+                                state.borrow_mut().status.discovery_error =
+                                    Some(format!("cannot inspect port {id}: {error}"));
+                                return;
+                            }
+                        };
+                        let info_state = Rc::downgrade(&state);
+                        let listener = port
+                            .add_listener_local()
+                            .info(move |info| {
+                                let Some(state) = info_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                let Some(port) = state.ports.get_mut(&id) else {
+                                    return;
+                                };
+                                if let Some(properties) = info.props() {
+                                    if let Some(channel) = properties.get("audio.channel") {
+                                        port.channel = channel.chars().take(32).collect();
+                                    }
+                                    port.monitor = properties.get("port.monitor") == Some("true");
+                                }
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
+                            })
+                            .register();
+                        Binding {
+                            _listener: Box::new(listener),
+                            object: BoundObject::Other {
+                                _proxy: Box::new(port),
+                            },
+                        }
+                    }
+                    ObjectType::Link => {
+                        if state.borrow().links.len() >= MAX_LINKS {
+                            return;
+                        }
+                        let link: pw::link::Link = match registry.bind(global) {
+                            Ok(link) => link,
+                            Err(_) => return,
+                        };
+                        let info_state = Rc::downgrade(&state);
+                        let listener = link
+                            .add_listener_local()
+                            .info(move |info| {
+                                let Some(state) = info_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                let owned = info.props().map_or_else(
+                                    || state.links.get(&id).is_some_and(|link| link.owned),
+                                    |props| props.get("cosmos.owner") == Some("cosmos-audio-mixer"),
+                                );
+                                state.links.insert(
+                                    id,
+                                    GraphLink {
+                                        output_port: info.output_port_id(),
+                                        input_port: info.input_port_id(),
+                                        owned,
+                                    },
+                                );
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
+                            })
+                            .register();
+                        Binding {
+                            _listener: Box::new(listener),
+                            object: BoundObject::Other {
+                                _proxy: Box::new(link),
+                            },
                         }
                     }
                     _ => return,
@@ -471,6 +666,9 @@ impl Connection {
                     if state.status.generation == generation {
                         state.nodes.remove(&id);
                         state.devices.remove(&id);
+                        state.ports.remove(&id);
+                        state.links.remove(&id);
+                        state.graph_revision = state.graph_revision.wrapping_add(1);
                     }
                 }
             })
@@ -482,6 +680,7 @@ impl Connection {
             _bindings: bindings,
             _registry: registry,
             _core: core,
+            context,
         })
     }
 }
@@ -542,5 +741,88 @@ mod tests {
         }
         let nodes = state.snapshot();
         assert_ne!(nodes[0].identity, nodes[1].identity);
+    }
+    #[test]
+    fn resolved_aliases_cannot_close_a_bus_feedback_cycle() {
+        use cosmos_control::{Bus, Channels, NodeRef, Profile, Route};
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        let mut record = Record::default();
+        record.properties.insert("node.name", "fixture".into());
+        record.properties.insert("object.path", "/fixture".into());
+        state.nodes.insert(7, record);
+        let bus = NodeRef::Bus { id: "test".into() };
+        let profile = Profile {
+            buses: vec![Bus {
+                id: "test".into(),
+                name: "Test".into(),
+                channels: Channels::Mono,
+                enabled: true,
+                hidden: false,
+                muted: false,
+                effects: vec![],
+            }],
+            routes: vec![
+                Route {
+                    id: "in".into(),
+                    from: NodeRef::Hardware {
+                        identity: BTreeMap::from([("node.name".into(), "fixture".into())]),
+                    },
+                    to: bus.clone(),
+                    enabled: true,
+                },
+                Route {
+                    id: "out".into(),
+                    from: bus,
+                    to: NodeRef::Hardware {
+                        identity: BTreeMap::from([("object.path".into(), "/fixture".into())]),
+                    },
+                    enabled: true,
+                },
+            ],
+            ..Profile::default()
+        };
+        assert!(
+            crate::runtime::validate_observed_profile(&profile, &state)
+                .unwrap_err()
+                .contains("cycle")
+        );
+    }
+
+    #[test]
+    fn raced_resource_errors_preserve_the_live_generation_and_request_reconcile() {
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        state.status.generation = 8;
+        state.nodes.insert(7, Record::default());
+        let revision = state.graph_revision;
+        state.core_error(
+            pw::core::PW_ID_CORE,
+            -libc::ENOENT,
+            "raced resource removal",
+        );
+        assert!(state.connection_error.is_none());
+        assert_eq!(state.status.phase, Phase::Connected);
+        assert_eq!(state.status.generation, 8);
+        assert_eq!(state.snapshot().len(), 1);
+        assert_ne!(state.graph_revision, revision);
+        assert!(
+            state
+                .status
+                .discovery_error
+                .as_ref()
+                .unwrap()
+                .contains("raced resource removal")
+        );
+        state.core_error(7, -libc::EPIPE, "individual resource failed");
+        assert!(state.connection_error.is_none());
+        state.core_error(pw::core::PW_ID_CORE, -libc::EPIPE, "transport closed");
+        assert!(
+            state
+                .connection_error
+                .as_ref()
+                .unwrap()
+                .contains("transport closed")
+        );
     }
 }

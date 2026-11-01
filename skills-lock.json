@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "audio-pipewire": {
+      "source": "damionrashford/media-os",
+      "sourceType": "github",
+      "skillPath": "skills/audio-pipewire/SKILL.md",
+      "computedHash": "62ae867d8a334ce83f75ca4801ddd773e1dddc7c38b31f5532e8ade07918bbde"
+    },
+    "cosmic-desktop-development": {
+      "source": "jotuel/cosmic-skills",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "61adfbc0ac5497a3224ca08c0a5ad91a80235c7ed86be3e3b9f517433240e8fe"
+    },
+    "dsp": {
+      "source": "shortwavlabs/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/dsp/SKILL.md",
+      "computedHash": "476ec0eb52a8ec30e09277ca333a43d14cea7da002855284281737a319a68880"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: MPL-2.0 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Cosmos Audio Mixer</title>
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="#173436"/>
+  <g fill="none" stroke="#67cfc6" stroke-width="6" stroke-linecap="round">
+    <path d="M34 25v78M64 25v78M94 25v78"/>
+  </g>
+  <g fill="#67cfc6" stroke="#173436" stroke-width="4">
+    <rect x="21" y="34" width="26" height="18" rx="6"/>
+    <rect x="51" y="74" width="26" height="18" rx="6"/>
+    <rect x="81" y="44" width="26" height="18" rx="6"/>
+  </g>
+</svg>

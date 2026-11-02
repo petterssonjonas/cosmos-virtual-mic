@@ -16,6 +16,10 @@ use pw::spa::param::{
 use pw::spa::utils::dict::DictRef;
 use pw::types::ObjectType;
 
+#[path = "devices.rs"]
+mod devices;
+use devices::DeviceRecord;
+
 pub const MAX_NODES: usize = 256;
 const MAX_DEVICES: usize = 128;
 const MAX_PROPERTY_BYTES: usize = 512;
@@ -27,8 +31,11 @@ const KEYS: &[&str] = &[
     "node.nick",
     "media.class",
     "object.path",
+    "object.serial",
     "device.id",
     "device.name",
+    "device.description",
+    "device.nick",
     "device.serial",
     "device.bus-id",
     "device.bus-path",
@@ -65,13 +72,37 @@ struct Record {
     properties: Properties,
     current_layout: Option<Layout>,
     available_layout: Option<Layout>,
+    format_readable: bool,
+    enum_format_readable: bool,
 }
 
 impl Record {
     fn update_param_flags(&mut self, parameter_type: ParamType, flags: ParamInfoFlags) {
-        if parameter_type == ParamType::Format && !flags.contains(ParamInfoFlags::READ) {
-            // Suspension can remove the readable format without emitting a null param.
-            self.current_layout = None;
+        let readable = flags.contains(ParamInfoFlags::READ);
+        match parameter_type {
+            ParamType::Format => {
+                self.format_readable = readable;
+                if !readable {
+                    // Suspension need not emit a null parameter.
+                    self.current_layout = None;
+                }
+            }
+            ParamType::EnumFormat => {
+                self.enum_format_readable = readable;
+                if !readable {
+                    self.available_layout = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn readable_params(&self) -> &'static [ParamType] {
+        match (self.format_readable, self.enum_format_readable) {
+            (true, true) => &[ParamType::Format, ParamType::EnumFormat],
+            (true, false) => &[ParamType::Format],
+            (false, true) => &[ParamType::EnumFormat],
+            (false, false) => &[],
         }
     }
 }
@@ -95,7 +126,9 @@ pub struct GraphLink {
 pub struct Observed {
     pub status: Status,
     nodes: BTreeMap<u32, Record>,
-    devices: BTreeMap<u32, Properties>,
+    devices: BTreeMap<u32, DeviceRecord>,
+    device_operation: Option<devices::PendingProfile>,
+    device_operation_sequence: u64,
     pub ports: BTreeMap<u32, Port>,
     pub links: BTreeMap<u32, GraphLink>,
     pub graph_revision: u64,
@@ -115,9 +148,13 @@ impl Observed {
                 last_control_error: None,
                 backend: BackendStatus::default(),
                 config_error: None,
+                config_pending: false,
+                device_profile_change: None,
             },
             nodes: BTreeMap::new(),
             devices: BTreeMap::new(),
+            device_operation: None,
+            device_operation_sequence: 0,
             ports: BTreeMap::new(),
             links: BTreeMap::new(),
             graph_revision: 0,
@@ -126,6 +163,7 @@ impl Observed {
     }
 
     pub fn reset(&mut self) {
+        self.fail_device_profile("PipeWire disconnected during native device profile change");
         self.nodes.clear();
         self.devices.clear();
         self.ports.clear();
@@ -152,7 +190,7 @@ impl Observed {
                     .filter_map(|&key| {
                         properties
                             .get(key)
-                            .or_else(|| device.and_then(|device| device.get(key)))
+                            .or_else(|| device.and_then(|device| device.properties.get(key)))
                             .map(|value| (key.to_owned(), value.clone()))
                     })
                     .collect();
@@ -194,8 +232,7 @@ impl Observed {
 
     fn core_error(&mut self, id: u32, result: i32, message: &str) {
         if result == -libc::ENOENT {
-            // This read-only connection can query a format before negotiation
-            // or an object after removal. The latter can be reported on the core.
+            // A request can race object removal, which can be reported on the core.
             // Reconcile without turning missing resources into a persistent error.
             self.graph_revision = self.graph_revision.wrapping_add(1);
             return;
@@ -303,6 +340,7 @@ struct Binding {
 
 enum BoundObject {
     Node(pw::node::Node),
+    Device(pw::device::Device),
     Other { _proxy: Box<dyn ProxyT> },
 }
 
@@ -360,11 +398,15 @@ impl Connection {
         let done_state = state.clone();
         let core_listener = core
             .add_listener_local()
-            .done(move |id, _sequence| {
+            .done(move |id, sequence| {
                 if id == pw::core::PW_ID_CORE
                     && let Some(state) = done_state.upgrade()
                 {
                     let mut state = state.borrow_mut();
+                    if state.status.generation != generation {
+                        return;
+                    }
+                    state.device_barrier_done(sequence.seq());
                     if state.status.generation == generation
                         && state.status.phase == Phase::Connecting
                     {
@@ -373,12 +415,17 @@ impl Connection {
                     }
                 }
             })
-            .error(move |id, _sequence, result, message| {
+            .error(move |id, sequence, result, message| {
                 if let Some(state) = state.upgrade() {
                     let mut state = state.borrow_mut();
                     if state.status.generation != generation {
                         return;
                     }
+                    state.device_error(
+                        id,
+                        sequence,
+                        &format!("PipeWire device operation failed ({result}): {message}"),
+                    );
                     state.core_error(id, result, message);
                 }
             })
@@ -442,6 +489,7 @@ impl Connection {
                         };
                         let info_state = Rc::downgrade(&state);
                         let param_state = info_state.clone();
+                        let info_bindings = Rc::downgrade(&bindings);
                         let listener = node
                             .add_listener_local()
                             .info(move |info| {
@@ -456,14 +504,31 @@ impl Connection {
                                 let Some(record) = state.nodes.get_mut(&id) else {
                                     return;
                                 };
+                                let previous = record.readable_params();
                                 for parameter in info.params() {
                                     record.update_param_flags(parameter.id(), parameter.flags());
                                 }
+                                let readable = record.readable_params();
                                 if let Some(properties) = info.props()
                                     && update(&mut record.properties, properties)
                                 {
                                     state.status.discovery_error =
                                         Some("oversized PipeWire property ignored".into());
+                                }
+                                drop(state);
+                                // Subscribing also enumerates immediately. An unconfigured
+                                // node can return EIO for Format until READ is advertised.
+                                if readable != previous
+                                    && let Some(bindings) = info_bindings.upgrade()
+                                {
+                                    let bindings = bindings.borrow();
+                                    if let Some(Binding {
+                                        object: BoundObject::Node(node),
+                                        ..
+                                    }) = bindings.get(&id)
+                                    {
+                                        node.subscribe_params(readable);
+                                    }
                                 }
                             })
                             .param(move |_sequence, parameter_type, index, _next, parameter| {
@@ -478,6 +543,10 @@ impl Connection {
                                 let Some(record) = state.nodes.get_mut(&id) else {
                                     return;
                                 };
+                                if !record.readable_params().contains(&parameter_type) {
+                                    // A reply queued before suspension must not restore stale layout.
+                                    return;
+                                }
                                 let layout = parameter.and_then(parameter_layout);
                                 if parameter_type == ParamType::Format {
                                     record.current_layout = layout;
@@ -491,7 +560,6 @@ impl Connection {
                                 }
                             })
                             .register();
-                        node.subscribe_params(&[ParamType::Format, ParamType::EnumFormat]);
                         Binding {
                             _listener: Box::new(listener),
                             object: BoundObject::Node(node),
@@ -507,21 +575,50 @@ impl Connection {
                                     Some(format!("discovery limited to {MAX_DEVICES} devices"));
                                 return;
                             }
-                            let mut properties = Properties::new();
+                            let mut record = DeviceRecord {
+                                permissions: Some(global.permissions),
+                                ..DeviceRecord::default()
+                            };
                             if let Some(dictionary) = global.props {
-                                update(&mut properties, dictionary);
+                                update(&mut record.properties, dictionary);
                             }
-                            state.devices.insert(id, properties);
+                            state.devices.insert(id, record);
                         }
                         let device: pw::device::Device = match registry.bind(global) {
                             Ok(device) => device,
                             Err(error) => {
-                                state.borrow_mut().status.discovery_error =
-                                    Some(format!("cannot inspect device {id}: {error}"));
+                                let message = format!("cannot inspect device {id}: {error}");
+                                let mut state = state.borrow_mut();
+                                state.status.discovery_error = Some(message.clone());
+                                if let Some(record) = state.devices.get_mut(&id) {
+                                    record.error = Some(message);
+                                }
                                 return;
                             }
                         };
                         let info_state = Rc::downgrade(&state);
+                        let param_state = info_state.clone();
+                        let error_state = info_state.clone();
+                        let info_bindings = Rc::downgrade(&bindings);
+                        let proxy_id = device.upcast_ref().id();
+                        let proxy_listener = device
+                            .upcast_ref()
+                            .add_listener_local()
+                            .error(move |sequence, result, message| {
+                                if let Some(state) = error_state.upgrade() {
+                                    let mut state = state.borrow_mut();
+                                    if state.status.generation != generation {
+                                        return;
+                                    }
+                                    let error =
+                                        format!("native device {id} failed ({result}): {message}");
+                                    state.device_error(proxy_id, sequence, &error);
+                                    if let Some(record) = state.devices.get_mut(&id) {
+                                        record.error = Some(error.chars().take(512).collect());
+                                    }
+                                }
+                            })
+                            .register();
                         let listener = device
                             .add_listener_local()
                             .info(move |info| {
@@ -533,20 +630,57 @@ impl Connection {
                                     return;
                                 }
                                 state.graph_revision = state.graph_revision.wrapping_add(1);
-                                if let Some(properties) = state.devices.get_mut(&id)
-                                    && let Some(dictionary) = info.props()
-                                    && update(properties, dictionary)
-                                {
-                                    state.status.discovery_error =
-                                        Some("oversized PipeWire property ignored".into());
+                                let Some(record) = state.devices.get_mut(&id) else {
+                                    return;
+                                };
+                                let previous = record.readable_params();
+                                for parameter in info.params() {
+                                    record.update_flags(parameter.id(), parameter.flags());
                                 }
+                                let readable = record.readable_params();
+                                if let Some(dictionary) = info.props()
+                                    && update(&mut record.properties, dictionary)
+                                {
+                                    record.error =
+                                        Some("oversized PipeWire device property ignored".into());
+                                }
+                                drop(state);
+                                if previous != readable
+                                    && let Some(bindings) = info_bindings.upgrade()
+                                {
+                                    let bindings = bindings.borrow();
+                                    if let Some(Binding {
+                                        object: BoundObject::Device(device),
+                                        ..
+                                    }) = bindings.get(&id)
+                                    {
+                                        device.subscribe_params(readable);
+                                    }
+                                }
+                            })
+                            .param(move |sequence, parameter_type, index, _next, parameter| {
+                                let Some(state) = param_state.upgrade() else {
+                                    return;
+                                };
+                                let mut state = state.borrow_mut();
+                                if state.status.generation != generation {
+                                    return;
+                                }
+                                if let Some(record) = state.devices.get_mut(&id) {
+                                    record.parameter(parameter_type, index, parameter);
+                                }
+                                if parameter_type == ParamType::Profile {
+                                    state.device_profile_seen(id, sequence);
+                                }
+                                state.graph_revision = state.graph_revision.wrapping_add(1);
                             })
                             .register();
                         Binding {
-                            _listener: Box::new(listener),
-                            object: BoundObject::Other {
-                                _proxy: Box::new(device),
-                            },
+                            _listener: Box::new(devices::DeviceListeners {
+                                _device: listener,
+                                _proxy: proxy_listener,
+                            }),
+                            object: BoundObject::Device(device),
                         }
                     }
                     ObjectType::Port => {
@@ -671,6 +805,7 @@ impl Connection {
                     let mut state = state.borrow_mut();
                     if state.status.generation == generation {
                         state.nodes.remove(&id);
+                        state.device_removed(id);
                         state.devices.remove(&id);
                         state.ports.remove(&id);
                         state.links.remove(&id);
@@ -699,7 +834,7 @@ mod tests {
     fn disconnect_clears_ids_and_device_properties() {
         let mut state = Observed::new();
         state.nodes.insert(17, Record::default());
-        state.devices.insert(2, Properties::new());
+        state.devices.insert(2, DeviceRecord::default());
         state.reset();
         state.status.phase = Phase::Connected;
         assert!(state.snapshot().is_empty());
@@ -797,6 +932,35 @@ mod tests {
     }
 
     #[test]
+    fn subscriptions_follow_format_readability_through_negotiation_and_suspend() {
+        let mut record = Record::default();
+        record.update_param_flags(ParamType::Format, ParamInfoFlags::WRITE);
+        record.update_param_flags(ParamType::EnumFormat, ParamInfoFlags::READ);
+        assert_eq!(record.readable_params(), &[ParamType::EnumFormat]);
+
+        record.update_param_flags(
+            ParamType::Format,
+            ParamInfoFlags::READ | ParamInfoFlags::WRITE,
+        );
+        assert_eq!(
+            record.readable_params(),
+            &[ParamType::Format, ParamType::EnumFormat]
+        );
+        record.current_layout = Some(Layout::new(Some(2), vec!["FL".into(), "FR".into()]));
+        record.available_layout = record.current_layout.clone();
+
+        record.update_param_flags(ParamType::Format, ParamInfoFlags::WRITE);
+        assert_eq!(record.readable_params(), &[ParamType::EnumFormat]);
+        assert!(record.current_layout.is_none());
+        record.update_param_flags(ParamType::EnumFormat, ParamInfoFlags::empty());
+        assert!(record.readable_params().is_empty());
+        assert!(record.available_layout.is_none());
+
+        record.update_param_flags(ParamType::Format, ParamInfoFlags::READ);
+        assert_eq!(record.readable_params(), &[ParamType::Format]);
+    }
+
+    #[test]
     fn missing_object_parameters_do_not_poison_discovery_or_clear_real_errors() {
         let mut state = Observed::new();
         state.status.phase = Phase::Connected;
@@ -805,14 +969,16 @@ mod tests {
         assert!(state.connection_error.is_none());
         assert_eq!(state.status.phase, Phase::Connected);
 
-        state.core_error(7, -libc::EACCES, "access denied");
-        let error = state.status.discovery_error.clone().unwrap();
-        state.core_error(8, -libc::ENOENT, "resource removed");
-        assert_eq!(
-            state.status.discovery_error.as_deref(),
-            Some(error.as_str())
-        );
-        assert!(state.connection_error.is_none());
+        for result in [-libc::EACCES, -libc::EIO] {
+            state.core_error(7, result, "parameter query failed");
+            let error = state.status.discovery_error.clone().unwrap();
+            state.core_error(8, -libc::ENOENT, "resource removed");
+            assert_eq!(
+                state.status.discovery_error.as_deref(),
+                Some(error.as_str())
+            );
+            assert!(state.connection_error.is_none());
+        }
     }
 
     #[test]

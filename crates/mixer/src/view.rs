@@ -2,7 +2,10 @@
 use cosmic::Element;
 use cosmic::iced::{Alignment, Length};
 use cosmic::widget::{self, button, column, row, text};
-use cosmos_control::{Bus, Channels, Effect, MeterSnapshot, NodeRef};
+use cosmos_control::{
+    Bus, Channels, DeviceProfileRequest, DeviceProfileState, Effect, MeterSnapshot, NodeRef,
+    ProfileAvailability,
+};
 
 use crate::app::{Flag, Message, Mixer, Page, Popup};
 use crate::model::{self, Parameter};
@@ -49,6 +52,9 @@ pub fn view(app: &Mixer) -> Element<'_, Message> {
     if let Some(error) = &app.control.connection_error {
         top = top.push(text::body(format!("Connection: {error}")));
     }
+    if let Some(error) = &app.control.device_error {
+        top = top.push(text::body(format!("System device: {error}")));
+    }
     if let Some(status) = &app.control.status {
         for error in [
             &status.config_error,
@@ -82,8 +88,14 @@ pub fn view(app: &Mixer) -> Element<'_, Message> {
     let mut actions = row::with_children([
         engine.into(),
         button::text("Reload…").on_press(Message::Reload).into(),
+        button::text("Quit Mixer").on_press(Message::Quit).into(),
         widget::space::horizontal().into(),
-        text::caption("Audio continues when this window closes").into(),
+        text::caption(if app.indicator_status.is_ok() {
+            "Close hides to the panel; audio keeps running"
+        } else {
+            "Close exits the mixer; audio keeps running"
+        })
+        .into(),
     ])
     .spacing(12)
     .align_y(Alignment::Center);
@@ -95,10 +107,10 @@ pub fn view(app: &Mixer) -> Element<'_, Message> {
             "Changes are kept here. Resolve the error to resume live audio updates."
         } else if app.control.action_busy() {
             "Saving final changes before continuing…"
-        } else if app.control.pending() && app.control.status.is_none() {
+        } else if app.control.needs_save() && app.control.status.is_none() {
             "Changes are kept here until the engine is connected and running."
-        } else if app.control.pending() {
-            "Updating audio and saving the latest changes…"
+        } else if app.control.needs_save() {
+            "Audio changes are live. Saving the complete profile…"
         } else if app.control.text_edits.pending() {
             "Name edits stay here until Enter or a final-save confirmation. Audio controls remain live."
         } else {
@@ -107,6 +119,10 @@ pub fn view(app: &Mixer) -> Element<'_, Message> {
         .into(),
         actions.into(),
     ])
+    .push(text::caption(match &app.indicator_status {
+        Ok(()) => "Panel indicator connected. Open Mixer restores this window.".to_owned(),
+        Err(reason) => format!("{reason}. Keep this window open or reopen the launcher. GNOME needs an AppIndicator extension."),
+    }))
     .spacing(8);
     widget::container(column::with_children([top.into(), content, footer.into()]).spacing(16))
         .padding(18)
@@ -141,7 +157,7 @@ fn mixer(app: &Mixer) -> Element<'_, Message> {
     let mut body = column::with_children([controls.into()]).spacing(16);
     if app.control.profile.buses.is_empty() {
         body = body.push(text::title3("A clear start. No audio routes selected."))
-            .push(text::body("Start the engine, add a mono voice channel or a stereo channel, then select explicit connections in Routing. No system defaults will change."));
+            .push(text::body("Start the engine, add a mono voice channel or a stereo channel, then select its Input below the channel name. Use Routing for outputs and multi-source mixes. No system defaults will change."));
     }
     body = body.push(widget::scrollable(strips).direction(
         cosmic::iced::widget::scrollable::Direction::Horizontal(
@@ -167,6 +183,7 @@ fn strip<'a>(app: &'a Mixer, index: usize, bus: &'a Bus) -> Element<'a, Message>
             .on_submit(move |_| Message::CommitName(index))
             .into(),
         text::caption("Press Enter to rename. Renaming can interrupt this channel.").into(),
+        channel_input(app, bus),
         text::body(state).into(),
     ])
     .spacing(6);
@@ -331,7 +348,7 @@ fn parameter<'a>(
     column::with_children([
         text::caption(format!("{label}  {value:.1} {unit}")).into(),
         widget::slider(range, value, move |v| {
-            Message::Parameter(bus, effect, parameter, v)
+            Message::Parameter(bus, effect, parameter, model::snap_control(v, step))
         })
         .description(format!("{label}, {unit}, channel {}", bus + 1))
         .step(step)
@@ -366,6 +383,67 @@ fn endpoint_name(app: &Mixer, endpoint: &NodeRef) -> String {
             })
             .unwrap_or_else(|| identity.values().cloned().collect::<Vec<_>>().join(" · ")),
     }
+}
+
+fn node_role(media_class: &str) -> &'static str {
+    match media_class {
+        "Audio/Source" => "Input device",
+        "Audio/Sink" => "Output device",
+        "Stream/Output/Audio" => "Input · app playback",
+        "Stream/Input/Audio" => "Output · app recording",
+        _ => "Unknown direction",
+    }
+}
+
+fn channel_input<'a>(app: &'a Mixer, bus: &'a Bus) -> Element<'a, Message> {
+    let mut inputs = model::channel_inputs(&app.control.profile, &bus.id);
+    let first = inputs.next();
+    let count = usize::from(first.is_some()) + inputs.count();
+    let mut sources = choices(app, true);
+    sources.retain(|(_, source)| !matches!(source, NodeRef::Bus { id } if id == &bus.id));
+    let selected = if count == 0 {
+        Some(0)
+    } else if let Some(route) = first.filter(|route| count == 1 && route.enabled) {
+        let index = sources
+            .iter()
+            .position(|(_, source)| source == &route.from)
+            .unwrap_or_else(|| {
+                sources.push((
+                    format!("Saved input: {}", endpoint_name(app, &route.from)),
+                    route.from.clone(),
+                ));
+                sources.len() - 1
+            });
+        Some(index + 1)
+    } else {
+        None
+    };
+    let labels: Vec<_> = std::iter::once("No routed input".to_owned())
+        .chain(sources.iter().map(|(label, _)| label.clone()))
+        .collect();
+    let bus_id = bus.id.clone();
+    let placeholder = if count > 1 {
+        format!("{count} input routes · see Routing")
+    } else {
+        format!(
+            "Disabled: {}",
+            first.map_or_else(String::new, |route| endpoint_name(app, &route.from))
+        )
+    };
+    column::with_children([
+        text::caption("Input").into(),
+        widget::dropdown(labels, selected, move |index| {
+            Message::Input(
+                bus_id.clone(),
+                index.checked_sub(1).map(|index| sources[index].1.clone()),
+            )
+        })
+        .placeholder(placeholder)
+        .width(Length::Fill)
+        .into(),
+    ])
+    .spacing(4)
+    .into()
 }
 
 fn choices(app: &Mixer, source: bool) -> Vec<(String, NodeRef)> {
@@ -409,7 +487,8 @@ fn choices(app: &Mixer, source: bool) -> Vec<(String, NodeRef)> {
                 };
                 (
                     format!(
-                        "{} · {} · {:?}",
+                        "{}: {} · {} · {:?}",
+                        node_role(&node.media_class),
                         endpoint_name(app, &endpoint),
                         node.name,
                         node.layout.kind
@@ -506,8 +585,9 @@ fn routing(app: &Mixer) -> Element<'_, Message> {
 
 fn devices(app: &Mixer) -> Element<'_, Message> {
     let mut content = column::with_children([
-        text::title2("Devices & applications").into(),
-        text::body("These controls affect only this mixer. Hidden is not muted. Device names, profiles, system volume, and defaults remain unchanged.").into(),
+        system_devices(app),
+        text::title2("Mixer-local devices & applications").into(),
+        text::body("Input sends audio into the mixer; Output receives audio from it. These local controls do not disable devices for other apps. Hidden is not muted.").into(),
     ]).spacing(16);
     for (index, device) in app
         .control
@@ -517,12 +597,24 @@ fn devices(app: &Mixer) -> Element<'_, Message> {
         .enumerate()
         .filter(|(_, d)| app.show_hidden || !d.hidden)
     {
-        let present = app.control.nodes.iter().any(|node| {
-            device
-                .identity
-                .iter()
-                .all(|(key, value)| node.identity.get(key) == Some(value))
-        });
+        let direction = app
+            .control
+            .nodes
+            .iter()
+            .filter(|node| {
+                device
+                    .identity
+                    .iter()
+                    .all(|(key, value)| node.identity.get(key) == Some(value))
+            })
+            .fold(0, |direction, node| {
+                direction
+                    | match node.media_class.as_str() {
+                        "Audio/Source" | "Stream/Output/Audio" => 1,
+                        "Audio/Sink" | "Stream/Input/Audio" => 2,
+                        _ => 0,
+                    }
+            });
         let identity = device
             .identity
             .iter()
@@ -537,7 +629,12 @@ fn devices(app: &Mixer) -> Element<'_, Message> {
                         .into(),
                     text::caption(format!(
                         "{} · {identity}",
-                        if present { "Present" } else { "Unavailable" }
+                        match direction {
+                            1 => "Input · present",
+                            2 => "Output · present",
+                            3 => "Input and output · present",
+                            _ => "Unavailable · direction unknown",
+                        }
                     ))
                     .into(),
                     row::with_children([
@@ -579,7 +676,9 @@ fn devices(app: &Mixer) -> Element<'_, Message> {
                     text::body(&node.description).into(),
                     text::caption(format!(
                         "{} · {} · {:?}",
-                        node.name, node.media_class, node.layout.kind
+                        node.name,
+                        node_role(&node.media_class),
+                        node.layout.kind
                     ))
                     .into(),
                 ])
@@ -595,6 +694,124 @@ fn devices(app: &Mixer) -> Element<'_, Message> {
     widget::scrollable(content).height(Length::Fill).into()
 }
 
+fn system_devices(app: &Mixer) -> Element<'_, Message> {
+    let mut content = column::with_children([
+        text::title2("System audio devices").into(),
+        text::body("These profiles affect every app. Off disables the entire sound card, which can include both microphones and speakers. Select an available active profile to enable it again.").into(),
+    ]).spacing(12);
+    if app.control.devices.is_empty() {
+        content = content.push(text::caption(
+            "No system device profiles available. Start the engine and connect to PipeWire.",
+        ));
+    }
+    if let Some(change) = app
+        .control
+        .status
+        .as_ref()
+        .and_then(|status| status.device_profile_change.as_ref())
+    {
+        content = content.push(text::body(match change.state {
+            DeviceProfileState::Pending => {
+                "Waiting for PipeWire to confirm the system profile…".to_owned()
+            }
+            DeviceProfileState::Confirmed => "System profile confirmed by PipeWire.".to_owned(),
+            DeviceProfileState::Failed => format!(
+                "System profile change failed: {}",
+                change.error.as_deref().unwrap_or("Unknown error")
+            ),
+        }));
+    }
+    for device in &app.control.devices {
+        let mut card = column::with_children([
+            text::title3(&device.description).into(),
+            text::caption(format!(
+                "{} · {}",
+                device.name,
+                if device.disabled {
+                    "Disabled for all apps"
+                } else {
+                    "System sound card"
+                }
+            ))
+            .into(),
+        ])
+        .spacing(6);
+        if let Some(error) = &device.error {
+            card = card.push(text::body(error));
+        }
+        let selected = device
+            .profiles
+            .iter()
+            .position(|profile| Some(profile.index) == device.current_profile);
+        if device.readable
+            && device.writable
+            && let Some(serial) = device.serial
+            && let Some(status) = &app.control.status
+            && !device.profiles.is_empty()
+            && !app.control.device_busy()
+            && !app.control.save_unavailable()
+        {
+            let labels: Vec<_> = device
+                .profiles
+                .iter()
+                .map(|profile| {
+                    format!(
+                        "{}{}",
+                        if profile.name == "off" {
+                            "Off — disable for all apps"
+                        } else {
+                            &profile.description
+                        },
+                        if profile.availability == ProfileAvailability::No {
+                            " (unavailable)"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect();
+            let engine_pid = status.pid;
+            let generation = device.generation;
+            let id = device.id;
+            let profiles: Vec<_> = device
+                .profiles
+                .iter()
+                .map(|profile| profile.index)
+                .collect();
+            card = card.push(text::caption("System profile")).push(
+                widget::dropdown(labels, selected, move |index| {
+                    Message::SystemProfile(DeviceProfileRequest {
+                        engine_pid,
+                        generation,
+                        id,
+                        serial,
+                        profile_index: profiles[index],
+                    })
+                })
+                .placeholder("Select system profile")
+                .width(Length::Fill),
+            );
+        } else {
+            card = card.push(text::caption(
+                selected.map_or("Profile unavailable".to_owned(), |index| {
+                    format!("Profile: {}", device.profiles[index].description)
+                }),
+            ));
+            if !device.writable || device.serial.is_none() {
+                card = card.push(text::caption(
+                    "System profile changes are not available for this device.",
+                ));
+            }
+        }
+        content = content.push(
+            widget::container(card)
+                .padding(14)
+                .class(cosmic::theme::Container::Card),
+        );
+    }
+    content.into()
+}
+
 pub fn dialog(app: &Mixer) -> Option<Element<'_, Message>> {
     let popup = app.popup.as_ref()?;
     let (title, body) = match popup {
@@ -606,6 +823,31 @@ pub fn dialog(app: &Mixer) -> Option<Element<'_, Message>> {
                 .get(*index)
                 .map(|bus| effects(app, *index, bus, *equalizer));
         }
+        Popup::SystemProfile {
+            device,
+            profile,
+            disabling,
+            ..
+        } => {
+            let mut confirm = if *disabling {
+                button::destructive("Disable for all apps")
+            } else {
+                button::suggested("Change system profile")
+            };
+            if !app.control.device_busy() && !app.control.save_unavailable() {
+                confirm = confirm.on_press(Message::Confirm);
+            }
+            return Some(widget::dialog()
+                .title(if *disabling { "Disable this system sound card?" } else { "Change this system sound card?" })
+                .body(format!("{device}\nSelected profile: {profile}\n\nThis can interrupt every app using this card and remove both its inputs and outputs. The OS may remember this choice. To restore audio, select an active profile here. Mixer-local settings and system defaults are not changed directly."))
+                .control(text::body(app.error.as_deref().unwrap_or("")))
+                .primary_action(confirm)
+                .secondary_action(button::standard("Cancel").on_press(Message::ClosePopup)).into());
+        }
+        Popup::ReplaceInput(..) => (
+            "Replace this channel's input routes?",
+            "This channel has multiple incoming routes, including any disabled routes. The selected input will replace all of them. Output routes and other channels are kept. Use Routing if you want to keep a multi-source mix.",
+        ),
         Popup::Remove(_) => (
             "Remove channel?",
             "This immediately removes the channel, its routes, and its audio endpoints.",
@@ -627,8 +869,8 @@ pub fn dialog(app: &Mixer) -> Option<Element<'_, Message>> {
             "Final changes are saved first. Then all mixer endpoints and routes stop. Other applications may lose their selected source. If saving fails, the engine is not stopped.",
         ),
         Popup::Close => (
-            "Save and close?",
-            "Final changes are saved before this window closes. If saving fails or a name is invalid, the window stays open. The engine keeps running.",
+            "Save before closing the mixer?",
+            "Final changes are saved first. Close hides to a connected panel indicator; Quit exits only the frontend. Without a panel host, Close exits the frontend. If saving fails or a name is invalid, the window stays open. The engine keeps running.",
         ),
     };
     let mut controls = column::with_capacity(4).spacing(8);
@@ -650,7 +892,7 @@ pub fn dialog(app: &Mixer) -> Option<Element<'_, Message>> {
     if matches!(popup, Popup::Reload)
         && (app.control.save_blocked()
             || app.control.text_edits.pending()
-            || (app.control.pending() && app.control.save_unavailable()))
+            || (app.control.needs_save() && app.control.save_unavailable()))
     {
         let mut discard = button::destructive("Discard pending changes and reload");
         if app.control.can_discard() {
@@ -830,7 +1072,7 @@ fn effects<'a>(
                                     index,
                                     Some(effect_index),
                                     Parameter::Frequency,
-                                    10_f32.powf(v).clamp(20.0, 20000.0),
+                                    model::snap_control(10_f32.powf(v).clamp(20.0, 20000.0), 1.0),
                                 )
                             },
                         )

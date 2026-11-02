@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use cosmos_control::model::{MAX_BUSES, MAX_EFFECTS};
-use cosmos_control::{Bus, Channels, DeviceSettings, Effect, EffectInstance, Profile};
+use cosmos_control::{
+    Bus, Channels, DeviceSettings, Effect, EffectInstance, NodeRef, Profile, Route,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum Parameter {
@@ -19,6 +21,14 @@ pub enum Parameter {
     EqGain,
     Q,
     Ceiling,
+}
+
+/// Snap GUI input, not imported profiles or DSP samples.
+pub fn snap_control(value: f32, step: f32) -> f32 {
+    // Divide by the reciprocal instead of multiplying by an inexact 0.1.
+    let scale = step.recip();
+    let rounded = (value * scale).round() / scale;
+    if rounded == 0.0 { 0.0 } else { rounded }
 }
 
 /// Create one channel without modifying or replacing any existing profile data.
@@ -394,12 +404,178 @@ pub fn set_route_enabled(profile: &mut Profile, index: usize, enabled: bool) -> 
     Ok(())
 }
 
+pub fn channel_inputs<'a>(profile: &'a Profile, bus: &'a str) -> impl Iterator<Item = &'a Route> {
+    profile
+        .routes
+        .iter()
+        .filter(move |route| matches!(&route.to, NodeRef::Bus { id } if id == bus))
+}
+
+/// Replace only this channel's incoming routes. Keep outgoing routes and roll back
+/// invalid edits. Replacing a multi-source mix requires explicit confirmation.
+pub fn set_channel_input(
+    profile: &mut Profile,
+    bus: &str,
+    source: Option<NodeRef>,
+    replace_multiple: bool,
+) -> Result<(), String> {
+    if !profile.buses.iter().any(|candidate| candidate.id == bus) {
+        return Err("This channel no longer exists.".into());
+    }
+    if !replace_multiple && channel_inputs(profile, bus).count() > 1 {
+        return Err("Confirm replacement of this channel's multiple input routes.".into());
+    }
+    let incoming = |route: &Route| matches!(&route.to, NodeRef::Bus { id } if id == bus);
+    let Some(source) = source else {
+        profile.routes.retain(|route| !incoming(route));
+        return Ok(());
+    };
+    if let Some(first) = profile.routes.iter().position(incoming) {
+        // Disable the extra inputs during validation, without copying route identities.
+        let disabled: Vec<_> = profile
+            .routes
+            .iter_mut()
+            .enumerate()
+            .skip(first + 1)
+            .filter(|(_, route)| incoming(route) && route.enabled)
+            .map(|(index, route)| {
+                route.enabled = false;
+                index
+            })
+            .collect();
+        let previous = std::mem::replace(&mut profile.routes[first].from, source);
+        let enabled = std::mem::replace(&mut profile.routes[first].enabled, true);
+        if let Err(error) = profile.validate() {
+            profile.routes[first].from = previous;
+            profile.routes[first].enabled = enabled;
+            for index in disabled {
+                profile.routes[index].enabled = true;
+            }
+            return Err(error.to_string());
+        }
+        let mut index = 0;
+        profile.routes.retain(|route| {
+            let keep = index == first || !incoming(route);
+            index += 1;
+            keep
+        });
+    } else {
+        let id = (1..=cosmos_control::model::MAX_ROUTES + 1)
+            .map(|number| format!("route-{number}"))
+            .find(|id| !profile.routes.iter().any(|route| &route.id == id))
+            .ok_or_else(|| "No unused route ID available.".to_owned())?;
+        profile.routes.push(Route {
+            id,
+            from: source,
+            to: NodeRef::Bus { id: bus.to_owned() },
+            enabled: true,
+        });
+        if let Err(error) = profile.validate() {
+            profile.routes.pop();
+            return Err(error.to_string());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn channel() -> Bus {
         new_bus(&Profile::default(), Channels::Stereo).unwrap()
+    }
+
+    #[test]
+    fn control_steps_remove_fraction_noise_and_negative_zero() {
+        assert_eq!(snap_control(-6.26, 0.5), -6.5);
+        assert_eq!(snap_control(1234.5678, 1.0), 1235.0);
+        let decimal = snap_control(0.1 + 12.0 * 0.1, 0.1);
+        assert_eq!(decimal, 1.3);
+        let neutral = snap_control(-0.01, 0.5);
+        assert_eq!(neutral.to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn channel_input_replacement_preserves_outputs_and_requires_multi_source_consent() {
+        let mut profile = Profile::default();
+        profile.buses.push(channel());
+        profile
+            .buses
+            .push(new_bus(&profile, Channels::Stereo).unwrap());
+        let bus = profile.buses[0].id.clone();
+        let endpoint = NodeRef::Bus { id: bus.clone() };
+        let source = |name: &str| NodeRef::Hardware {
+            identity: BTreeMap::from([("node.name".into(), name.into())]),
+        };
+        let output = Route {
+            id: "output".into(),
+            from: endpoint.clone(),
+            to: NodeRef::Bus {
+                id: profile.buses[1].id.clone(),
+            },
+            enabled: true,
+        };
+        profile.routes = vec![
+            Route {
+                id: "mic".into(),
+                from: source("old-mic"),
+                to: endpoint.clone(),
+                enabled: true,
+            },
+            output.clone(),
+            Route {
+                id: "app".into(),
+                from: source("player"),
+                to: endpoint,
+                enabled: false,
+            },
+        ];
+        let original = profile.clone();
+        assert!(set_channel_input(&mut profile, &bus, Some(source("new-mic")), false).is_err());
+        assert_eq!(profile, original);
+        assert!(set_channel_input(&mut profile, &bus, None, false).is_err());
+        assert_eq!(profile, original);
+        set_channel_input(&mut profile, &bus, Some(source("new-mic")), true).unwrap();
+        assert_eq!(
+            profile.routes,
+            vec![
+                Route {
+                    id: "mic".into(),
+                    from: source("new-mic"),
+                    to: NodeRef::Bus { id: bus.clone() },
+                    enabled: true
+                },
+                output.clone(),
+            ]
+        );
+        set_channel_input(&mut profile, &bus, None, false).unwrap();
+        assert_eq!(profile.routes, vec![output]);
+    }
+
+    #[test]
+    fn channel_input_feedback_rejection_restores_all_routes_and_flags() {
+        let mut profile = Profile::default();
+        profile.buses.push(channel());
+        let bus = profile.buses[0].id.clone();
+        let endpoint = NodeRef::Bus { id: bus.clone() };
+        profile.routes = ["a", "b"]
+            .into_iter()
+            .map(|name| Route {
+                id: name.into(),
+                from: NodeRef::Hardware {
+                    identity: BTreeMap::from([("node.name".into(), name.into())]),
+                },
+                to: endpoint.clone(),
+                enabled: name == "b",
+            })
+            .collect();
+        let original = profile.clone();
+        assert!(set_channel_input(&mut profile, &bus, Some(endpoint.clone()), true).is_err());
+        assert_eq!(profile, original);
+        profile.routes.clear();
+        assert!(set_channel_input(&mut profile, &bus, Some(endpoint), false).is_err());
+        assert!(profile.routes.is_empty());
     }
 
     #[test]

@@ -1,0 +1,11 @@
+# Managed by the Cosmos Audio Mixer per-user installer.
+[Desktop Entry]
+Type=Application
+Name=Cosmos Audio Mixer
+Comment=Control the Cosmos Audio Mixer engine
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupNotify=true
+StartupWMClass=io.github.petterssonjonas.CosmosAudioMixer

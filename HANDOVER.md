@@ -2,11 +2,29 @@
 
 ## Resume here
 
-Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside the `cosmos` toolbox and source `dev-env.sh` before Rust commands. The main checkout is `/home/jp/Projects/cosmos-audio-mixer`. Current frontend work is in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/native-mixer`, on `feature/native-mixer`, based on refreshed `origin/development`. The main checkout's pre-existing `.gitignore` change was left untouched.
+Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside `cosmos` and source `dev-env.sh` before Rust commands. Continue in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/mixer-inputs-and-diagnostics`, branch `feature/mixer-inputs-and-diagnostics`, based on `origin/development` at `46aa805bdcdc54877aa39f38f3ef8added0f286a`. Do not leave this worktree. The main checkout's unrelated `.gitignore` change remains untouched.
 
 The Rust backend hosts native LSP DSP, named playback/recording endpoints, explicit routes, real input/output levels, and validated persistent profiles. The native libcosmic frontend is implemented. Physical hardware, latency, clock drift, desktop accessibility, and long-running reliability remain release validation work; do not claim release readiness.
 
-## Native frontend — 2026-11-02
+## Service, persistence, and panel candidate — 2026-11-02
+
+- Current authorization: create a new PR to `development` and provide compiled workstation test bundles. **Do not merge until the owner tests and approves.** Earlier merge authorization below is history, not current permission. Do not add package publishing or distribution CI/CD yet.
+- Draft [PR #3](https://github.com/petterssonjonas/cosmos-audio-mixer/pull/3) is open and unmerged.
+- The default frontend controls `cosmos-audio-mixer.service`. `--standalone` or explicit socket/remote/config options use direct sibling-engine control. The engine remains independent of the frontend and restores its complete saved mixer profile.
+- Controls remain live. Protocol-3 Update changes audio now and debounces complete-profile persistence for two seconds. Flush, frontend close/hide/quit, and Stop require a durable save. Signals and fatal exits attempt a final save. Failed saves retain live state and an error; forced termination or power loss can still lose unsaved RAM.
+- GUI values snap to useful steps, including 0.5 dB color movement and whole-Hertz EQ frequency. Decimal controls save concise values. Imported settings, DSP samples and measured levels retain their precision.
+- External profile changes from the same connected engine are adopted even while its disk save is pending. Unsent edits and accepted-but-unsaved settings after engine loss remain protected. Regression coverage includes engine restart both with and without an observed transport failure.
+- Native StatusNotifierItem/D-BusMenu provides Open, Hide, Start/Stop and Quit. Window close hides only with a registered host; host loss restores the window. Quit leaves the engine running. Normal launches use one frontend instance.
+- The installer is now 143 lines of Bash, replacing the 493-line Python implementation. It installs ordinary files in `~/.local/bin`, installs the user unit and desktop/icon, and retains itself under `$XDG_DATA_HOME/cosmos-audio-mixer`. There is no Python runtime dependency, ownership database or release directory. Both old opt layouts migrate automatically after a safe old-client stop; their files are archived, not deleted. On later failure, previous files are retained and the error is reported; there is no automatic rollback.
+- The bundle ABI floor is glibc 2.39 for x86-64 and ARM64, built with Ubuntu 24.04 sysroots rather than the updated server's glibc 2.44. Stock Ubuntu support starts at 26.04: 24.04 disables LV2. Ubuntu 26 requires `libspa-0.2-modules-extra`. Actual Ubuntu 26 mono/stereo audio passed; ARM64 effects and live gain passed under QEMU, not physical ARM hardware.
+- The current work also includes terminal logging flags, per-strip Input routing, input/output labels, confirmed system-card profile controls, and the readable-Format discovery correction. Protocol version is 3; saved profile version stays 1. Replace both executables together through the installer.
+- Rust candidate verification remains 128 tests, formatting, Clippy, locked builds, and native backend/GUI scenarios. The Bash replacement passed syntax, installer regressions, native systemd unit validation and GIO launcher parsing. A real engine in the old flat layout saved a pending edit during automatic migration, the installed engine restored it, and uninstall saved its final edit while retaining the profile. The service-manager boundary was isolated; no host audio was changed. Evidence: `/var/tmp/cosmos-bash-native-t9qqsz6t`.
+- A real private systemd user manager cannot run in this toolbox because its cgroup is not delegated. Do not change host/podman settings to bypass this. Real service start/enable/login restore, GNOME indicator rendering and launcher focus remain workstation acceptance checks.
+- Current test bundles: `/home/jp/Projects/cosmos-audio-mixer-test/bash-installer/{x86_64,aarch64}/`. Binaries are unchanged from `service-and-indicator-r2`. Existing downloads need only the new `install.sh`, `SHA256SUMS` and `BUILD-INFO.json`; the SHA check confirms the whole bundle. `DEVELOPMENT.md` gives exact workstation copy/install/removal commands. Server: `jp@192.168.0.2`. Do not ask the user to move the old opt directory manually.
+
+Current local evidence: `/var/tmp/cosmos-backend-bkdobtdi`, `/var/tmp/cosmos-service-ui-02nf_b52`, `/var/tmp/cosmos-ubuntu26-audio-mtw_3ww_`, and `/var/tmp/cosmos-arm64-audio-bkun6l1_`. The corrected real GUI adopted an external rename and mute during the deferred-save window without a false conflict; its captures are in `/var/tmp/cosmos-profile-adoption-4sh51jvr`. These paths are test artifacts, not source assets or release packages.
+
+## Native frontend — 2026-11-02 (historical)
 
 - Added `crates/mixer`, package/executable `cosmos-audio-mixer`, pinned to libcosmic `95236a944bfd51c63a2fc65fe50a592c47168d40`. The engine and control crates remain toolkit-independent.
 - Added mono/stereo channel strips with volume, gate/compressor threshold and enable controls, full dynamics popup, per-channel parametric EQ popup, real input/output meters, and independent mute/hide/enable controls.
@@ -27,10 +45,10 @@ Launch from the feature worktree after sourcing `dev-env.sh`:
 
 ```sh
 cargo build --workspace --locked
-./target/debug/cosmos-audio-mixer
+./target/debug/cosmos-audio-mixer --standalone
 ```
 
-The repository now has `origin`. SSH authentication was unavailable in this session; HTTPS with the installed `gh` credential helper worked without global credential changes. The user authorized a reviewed PR and squash merge to `development` after validation, not a merge to `main` or a published Release. Consult the PR and its checks for hosted state.
+The repository has `origin`. Earlier sessions used HTTPS with the installed `gh` credential helper when SSH authentication was unavailable, without global credential changes. Earlier frontend merge authorization applied to that delivery only. The current service/panel candidate must remain unmerged pending workstation approval.
 
 The workstation target is Fedora 44 Workstation, x86-64, glibc 2.43. Prefer copying both optimized test executables together and installing native runtime dependencies; see `DEVELOPMENT.md`. This is private development testing, not distribution packaging. Do not replace workstation glibc or change host audio defaults.
 

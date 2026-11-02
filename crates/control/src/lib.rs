@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod diagnostics;
 pub mod model;
 pub mod socket;
 pub use model::{
@@ -18,7 +19,7 @@ pub use model::{
     NodeRef, Profile, Route, RouteStatus, RuntimeState,
 };
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 3;
 pub const MAX_REQUEST_BYTES: usize = model::MAX_PROFILE_BYTES + 4096;
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -31,6 +32,9 @@ pub enum Command {
     Stop,
     GetProfile,
     Apply,
+    Update,
+    Flush,
+    SetDeviceProfile,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -40,6 +44,8 @@ pub struct Request {
     pub command: Command,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_profile: Option<DeviceProfileRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -64,6 +70,10 @@ pub struct Status {
     pub backend: BackendStatus,
     /// Recoverable configuration error. Defaults are never written over unreadable data.
     pub config_error: Option<String>,
+    /// Accepted live changes that have not yet been durably saved.
+    pub config_pending: bool,
+    /// Latest explicit OS profile operation; never part of a saved mixer profile.
+    pub device_profile_change: Option<DeviceProfileChange>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -113,6 +123,66 @@ pub struct Node {
     pub layout: Layout,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileAvailability {
+    Unknown,
+    No,
+    Yes,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DeviceProfile {
+    pub index: i32,
+    pub name: String,
+    pub description: String,
+    pub availability: ProfileAvailability,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AudioDevice {
+    pub id: u32,
+    pub generation: u64,
+    /// Missing or malformed serials make the device unsafe to target.
+    pub serial: Option<u64>,
+    pub name: String,
+    pub description: String,
+    pub current_profile: Option<i32>,
+    pub profiles: Vec<DeviceProfile>,
+    /// True only for an explicitly advertised current profile named "off".
+    pub disabled: bool,
+    pub readable: bool,
+    pub writable: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceProfileRequest {
+    pub engine_pid: u32,
+    pub generation: u64,
+    pub id: u32,
+    pub serial: u64,
+    pub profile_index: i32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceProfileState {
+    Pending,
+    Confirmed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DeviceProfileChange {
+    /// Engine-local correlation token, unique for every accepted native operation.
+    pub sequence: u64,
+    pub request: DeviceProfileRequest,
+    pub state: DeviceProfileState,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Response {
@@ -120,6 +190,7 @@ pub enum Response {
         version: u32,
         status: Status,
         nodes: Vec<Node>,
+        devices: Vec<AudioDevice>,
     },
     Stopping {
         version: u32,
@@ -133,6 +204,10 @@ pub enum Response {
         version: u32,
         accepted: bool,
         status: Status,
+    },
+    DeviceProfile {
+        version: u32,
+        change: DeviceProfileChange,
     },
     Error {
         version: u32,
@@ -172,9 +247,26 @@ pub fn decode_request(bytes: &[u8]) -> io::Result<Request> {
         return Err(invalid("unsupported control protocol version"));
     }
     match (&request.command, &request.profile) {
-        (Command::Apply, Some(profile)) => profile.validate()?,
-        (Command::Apply, None) => return Err(invalid("apply requires a profile")),
-        (_, Some(_)) => return Err(invalid("profile is valid only for apply")),
+        (Command::Apply | Command::Update, Some(profile)) => profile.validate()?,
+        (Command::Apply | Command::Update, None) => {
+            return Err(invalid("apply and update require a profile"));
+        }
+        (_, Some(_)) => return Err(invalid("profile is valid only for apply or update")),
+        _ => {}
+    }
+    match (&request.command, &request.device_profile) {
+        (Command::SetDeviceProfile, Some(selection)) if selection.profile_index >= 0 => {}
+        (Command::SetDeviceProfile, Some(_)) => {
+            return Err(invalid("device profile index must be nonnegative"));
+        }
+        (Command::SetDeviceProfile, None) => {
+            return Err(invalid("set_device_profile requires device_profile"));
+        }
+        (_, Some(_)) => {
+            return Err(invalid(
+                "device_profile is valid only for set_device_profile",
+            ));
+        }
         _ => {}
     }
     Ok(request)
@@ -327,18 +419,49 @@ pub fn request(path: &Path, command: Command) -> io::Result<Response> {
             version: VERSION,
             command,
             profile: None,
+            device_profile: None,
         },
     )
 }
 
+/// Apply a complete profile and acknowledge it only after a durable save.
 pub fn apply(path: &Path, profile: Profile) -> io::Result<Response> {
+    send_profile(path, Command::Apply, profile)
+}
+
+/// Apply a complete profile to live audio; inspect Status.config_pending for durability.
+pub fn update(path: &Path, profile: Profile) -> io::Result<Response> {
+    send_profile(path, Command::Update, profile)
+}
+
+/// Save all accepted live changes now. A save failure returns Response::Error.
+pub fn flush(path: &Path) -> io::Result<Response> {
+    request(path, Command::Flush)
+}
+
+fn send_profile(path: &Path, command: Command, profile: Profile) -> io::Result<Response> {
     profile.validate()?;
     send_request(
         path,
         Request {
             version: VERSION,
-            command: Command::Apply,
+            command,
             profile: Some(profile),
+            device_profile: None,
+        },
+    )
+}
+
+/// Submit an explicit OS-level profile selection. A pending response is not success;
+/// poll Status.device_profile_change for native confirmation or failure.
+pub fn set_device_profile(path: &Path, selection: DeviceProfileRequest) -> io::Result<Response> {
+    send_request(
+        path,
+        Request {
+            version: VERSION,
+            command: Command::SetDeviceProfile,
+            profile: None,
+            device_profile: Some(selection),
         },
     )
 }
@@ -393,6 +516,7 @@ fn send_request(path: &Path, request: Request) -> io::Result<Response> {
                         | Response::Stopping { version, .. }
                         | Response::Profile { version, .. }
                         | Response::Applied { version, .. }
+                        | Response::DeviceProfile { version, .. }
                         | Response::Error { version, .. } => *version,
                     };
                     if version != VERSION {
@@ -426,28 +550,52 @@ mod tests {
     #[test]
     fn requests_reject_unknown_commands_versions_and_fields() {
         for bytes in [
+            br#"{"version":1,"command":"stop"}"#.as_slice(),
+            br#"{"version":3,"command":"route"}"#.as_slice(),
+            br#"{"version":3,"command":"stop","extra":1}"#.as_slice(),
+            br#"{"version":3,"command":"apply"}"#.as_slice(),
+            br#"{"version":3,"command":"update"}"#.as_slice(),
+            br#"{"version":3,"command":"status","profile":{"version":1,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
+            br#"{"version":3,"command":"apply","profile":{"version":2,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
+            br#"{"version":3,"command":"update","profile":{"version":2,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
             br#"{"version":2,"command":"stop"}"#.as_slice(),
-            br#"{"version":1,"command":"route"}"#.as_slice(),
-            br#"{"version":1,"command":"stop","extra":1}"#.as_slice(),
-            br#"{"version":1,"command":"apply"}"#.as_slice(),
-            br#"{"version":1,"command":"status","profile":{"version":1,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
-            br#"{"version":1,"command":"apply","profile":{"version":2,"buses":[],"devices":[],"routes":[]}}"#.as_slice(),
         ] {
             assert!(decode_request(bytes).is_err());
         }
     }
 
     #[test]
-    fn apply_accepts_only_validated_profiles_and_profile_query_is_separate() {
-        let apply = decode_request(br#"{"version":1,"command":"apply","profile":{"version":1,"buses":[],"devices":[],"routes":[]}}"#).unwrap();
-        assert_eq!(apply.command, Command::Apply);
-        assert_eq!(apply.profile.unwrap(), Profile::default());
-        assert_eq!(
-            decode_request(br#"{"version":1,"command":"get_profile"}"#)
-                .unwrap()
-                .command,
-            Command::GetProfile
-        );
+    fn profile_commands_accept_only_validated_complete_profiles() {
+        for (name, command) in [("apply", Command::Apply), ("update", Command::Update)] {
+            let bytes = format!(
+                r#"{{"version":3,"command":"{name}","profile":{{"version":1,"buses":[],"devices":[],"routes":[]}}}}"#
+            );
+            let request = decode_request(bytes.as_bytes()).unwrap();
+            assert_eq!(request.command, command);
+            assert_eq!(request.profile.unwrap(), Profile::default());
+        }
+        for (name, command) in [
+            ("get_profile", Command::GetProfile),
+            ("flush", Command::Flush),
+        ] {
+            let bytes = format!(r#"{{"version":3,"command":"{name}"}}"#);
+            assert_eq!(decode_request(bytes.as_bytes()).unwrap().command, command);
+        }
+    }
+
+    #[test]
+    fn os_profile_requests_are_explicit_and_separate_from_saved_profiles() {
+        let request = decode_request(br#"{"version":3,"command":"set_device_profile","device_profile":{"engine_pid":100,"generation":3,"id":9,"serial":42,"profile_index":0}}"#).unwrap();
+        assert_eq!(request.device_profile.unwrap().serial, 42);
+        for bytes in [
+            br#"{"version":3,"command":"set_device_profile"}"#.as_slice(),
+            br#"{"version":3,"command":"status","device_profile":{"engine_pid":100,"generation":3,"id":9,"serial":42,"profile_index":0}}"#.as_slice(),
+            br#"{"version":3,"command":"set_device_profile","device_profile":{"engine_pid":100,"generation":3,"id":9,"profile_index":0}}"#.as_slice(),
+            br#"{"version":3,"command":"set_device_profile","device_profile":{"engine_pid":100,"generation":3,"id":9,"serial":42,"profile_index":-1}}"#.as_slice(),
+            br#"{"version":3,"command":"set_device_profile","device_profile":{"generation":3,"id":9,"serial":42,"profile_index":0}}"#.as_slice(),
+        ] {
+            assert!(decode_request(bytes).is_err());
+        }
     }
 
     #[test]

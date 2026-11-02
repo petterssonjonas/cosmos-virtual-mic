@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-use crate::app::Message;
+use crate::{app::Message, model};
 use cosmic::iced::{Color, Point, Rectangle, Renderer, mouse};
 use cosmic::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
 
@@ -35,6 +35,8 @@ impl canvas::Program<Message, cosmic::Theme> for ColorPad {
         let point = cursor.position()?;
         let warmth = ((point.x - bounds.x) / bounds.width * 24.0 - 12.0).clamp(-12.0, 12.0);
         let brightness = (12.0 - (point.y - bounds.y) / bounds.height * 24.0).clamp(-12.0, 12.0);
+        let warmth = model::snap_control(warmth, 0.5);
+        let brightness = model::snap_control(brightness, 0.5);
         Some(
             cosmic::iced::widget::Action::publish(Message::Color(self.index, warmth, brightness))
                 .and_capture(),

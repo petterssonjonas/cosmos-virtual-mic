@@ -7,10 +7,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use cosmos_control::{self as control, Profile, model::MAX_PROFILE_BYTES};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+const SAVE_DELAY: Duration = Duration::from_secs(2);
 
 pub fn default_path() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
@@ -162,6 +164,8 @@ pub struct Store {
     pub profile: Profile,
     pub error: Option<String>,
     lock: Option<File>,
+    pending: bool,
+    save_at: Option<Instant>,
 }
 
 impl Store {
@@ -171,6 +175,8 @@ impl Store {
             profile: Profile::default(),
             error: None,
             lock: None,
+            pending: false,
+            save_at: None,
         };
         if let Err(error) = store.initialize() {
             store.error = Some(error.to_string());
@@ -221,12 +227,76 @@ impl Store {
         Ok(())
     }
 
+    pub fn report_status(&self, status: &mut control::Status) {
+        status.config_pending = self.pending;
+        if status.config_error != self.error {
+            status.config_error.clone_from(&self.error);
+        }
+    }
+
+    pub fn update(&mut self, profile: Profile, now: Instant) -> io::Result<()> {
+        profile.validate()?;
+        if self.profile != profile {
+            self.profile = profile;
+            self.pending = true;
+            self.save_at = Some(now + SAVE_DELAY);
+        } else if self.error.is_some() && self.save_at.is_none() {
+            // An explicit repeated edit can retry a failed save, but status polling
+            // and unchanged values must not keep moving an active idle deadline.
+            self.pending = true;
+            self.save_at = Some(now + SAVE_DELAY);
+        }
+        Ok(())
+    }
+
     pub fn apply(&mut self, profile: Profile) -> io::Result<()> {
         profile.validate()?;
-        match self.save(&profile) {
-            Ok(sync_error) => {
-                self.profile = profile;
-                self.error = sync_error;
+        let result = self.prepare_write().and_then(|()| self.save(&profile));
+        if result.is_ok() {
+            self.profile = profile;
+            self.pending = true;
+        }
+        self.finish_save(result)
+    }
+
+    pub fn save_if_due(&mut self, now: Instant) -> io::Result<()> {
+        if self.save_at.is_some_and(|deadline| now >= deadline) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.pending {
+            // A startup read failure is not permission to overwrite its fallback.
+            return self
+                .error
+                .as_ref()
+                .map_or(Ok(()), |error| Err(io::Error::other(error.clone())));
+        }
+        let result = self.prepare_write().and_then(|()| self.save(&self.profile));
+        self.finish_save(result)
+    }
+
+    pub fn flush_on_shutdown(&mut self) -> io::Result<()> {
+        if self.pending {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn finish_save(&mut self, result: io::Result<Option<String>>) -> io::Result<()> {
+        // Failed automatic saves wait for a new edit or an explicit flush, not
+        // another attempt on every engine tick.
+        self.save_at = None;
+        let result = result.and_then(|sync_error| match sync_error {
+            Some(message) => Err(io::Error::other(message)),
+            None => Ok(()),
+        });
+        match result {
+            Ok(()) => {
+                self.pending = false;
+                self.error = None;
                 Ok(())
             }
             Err(error) => {
@@ -236,11 +306,14 @@ impl Store {
         }
     }
 
+    fn prepare_write(&mut self) -> io::Result<()> {
+        prepare_parent(&self.path)?;
+        self.acquire_lock()
+    }
+
     // Once rename succeeds desired state is accepted even if the directory fsync fails;
     // report that durability error separately rather than claim the old state is retained.
-    fn save(&mut self, profile: &Profile) -> io::Result<Option<String>> {
-        prepare_parent(&self.path)?;
-        self.acquire_lock()?;
+    fn save(&self, profile: &Profile) -> io::Result<Option<String>> {
         let bytes = control::encode(profile, MAX_PROFILE_BYTES)?;
         let existing = match open_private(&self.path) {
             Ok(file) => Some(file),
@@ -295,6 +368,291 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control::{Bus, Channels, DeviceSettings, Effect, EffectInstance, NodeRef, Route};
+
+    fn temporary_config() -> PathBuf {
+        let directory = PathBuf::from("/var/tmp").join(format!(
+            "cosmos-profile-debounce-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        directory.join("profile.json")
+    }
+
+    fn complete_profile(gain_db: f32) -> Profile {
+        let identity =
+            std::collections::BTreeMap::from([("node.name".into(), "fixture-source".into())]);
+        Profile {
+            version: control::model::PROFILE_VERSION,
+            buses: vec![Bus {
+                id: "voice".into(),
+                name: "Saved voice".into(),
+                channels: Channels::Stereo,
+                enabled: false,
+                hidden: true,
+                muted: true,
+                gain_db,
+                effects: vec![
+                    EffectInstance {
+                        id: "gate".into(),
+                        enabled: false,
+                        effect: Effect::Gate {
+                            threshold_db: -42.0,
+                            attack_ms: 5.0,
+                            hold_ms: 15.0,
+                            release_ms: 60.0,
+                        },
+                    },
+                    EffectInstance {
+                        id: "compressor".into(),
+                        enabled: true,
+                        effect: Effect::Compressor {
+                            threshold_db: -18.0,
+                            ratio: 3.0,
+                            attack_ms: 10.0,
+                            release_ms: 100.0,
+                            makeup_db: 2.0,
+                        },
+                    },
+                    EffectInstance {
+                        id: "color-low".into(),
+                        enabled: true,
+                        effect: Effect::Equalizer {
+                            frequency_hz: 150.0,
+                            gain_db: 3.0,
+                            q: 0.7,
+                        },
+                    },
+                    EffectInstance {
+                        id: "color-mid".into(),
+                        enabled: true,
+                        effect: Effect::Equalizer {
+                            frequency_hz: 1200.0,
+                            gain_db: -2.0,
+                            q: 1.0,
+                        },
+                    },
+                    EffectInstance {
+                        id: "color-high".into(),
+                        enabled: false,
+                        effect: Effect::Equalizer {
+                            frequency_hz: 8000.0,
+                            gain_db: 4.0,
+                            q: 0.8,
+                        },
+                    },
+                    EffectInstance {
+                        id: "limiter".into(),
+                        enabled: true,
+                        effect: Effect::Limiter {
+                            ceiling_db: -1.0,
+                            release_ms: 5.0,
+                        },
+                    },
+                ],
+            }],
+            devices: vec![DeviceSettings {
+                identity: identity.clone(),
+                alias: "Saved hardware".into(),
+                enabled: false,
+                hidden: true,
+                muted: true,
+            }],
+            routes: vec![Route {
+                id: "input".into(),
+                from: NodeRef::Hardware { identity },
+                to: NodeRef::Bus { id: "voice".into() },
+                enabled: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn updates_save_complete_latest_state_only_after_two_idle_seconds() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        store.apply(Profile::default()).unwrap();
+        let original = fs::read(&config).unwrap();
+        let now = Instant::now();
+        let first = complete_profile(-6.0);
+        store.update(first.clone(), now).unwrap();
+        assert_eq!(store.profile, first);
+        assert!(store.pending);
+        store
+            .save_if_due(now + Duration::from_millis(1499))
+            .unwrap();
+        assert_eq!(fs::read(&config).unwrap(), original);
+        let latest = complete_profile(-12.0);
+        store
+            .update(latest.clone(), now + Duration::from_millis(1500))
+            .unwrap();
+        store.save_if_due(now + SAVE_DELAY).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), original);
+        // Repeated values do not defer the changed value's idle deadline.
+        store
+            .update(latest.clone(), now + Duration::from_secs(3))
+            .unwrap();
+        store
+            .save_if_due(now + Duration::from_millis(3499))
+            .unwrap();
+        assert_eq!(fs::read(&config).unwrap(), original);
+        store
+            .save_if_due(now + Duration::from_millis(3500))
+            .unwrap();
+        assert!(!store.pending);
+        assert_eq!(fs::metadata(&config).unwrap().mode() & 0o777, 0o600);
+        drop(store);
+        let restored = Store::load(config.clone());
+        assert_eq!(restored.profile, latest);
+        assert!(restored.error.is_none());
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unchanged_defaults_do_not_create_a_profile_or_startup_autosave() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        let now = Instant::now();
+        store.update(Profile::default(), now).unwrap();
+        store.save_if_due(now + SAVE_DELAY).unwrap();
+        store.flush_on_shutdown().unwrap();
+        assert!(!store.pending);
+        assert!(!config.exists());
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_autosave_retains_live_state_and_waits_for_explicit_recovery() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        store.apply(Profile::default()).unwrap();
+        let original = fs::read(&config).unwrap();
+        let previous = config.with_extension("previous");
+        let desired = complete_profile(-9.0);
+        let now = Instant::now();
+        store.update(desired.clone(), now).unwrap();
+        fs::rename(&config, &previous).unwrap();
+        fs::create_dir(&config).unwrap();
+        assert!(store.save_if_due(now + SAVE_DELAY).is_err());
+        let failure = store.error.clone();
+        assert!(failure.is_some());
+        assert!(store.pending);
+        assert_eq!(store.profile, desired);
+        // Failed Apply must not replace already accepted unsaved desired state.
+        assert!(store.apply(complete_profile(-3.0)).is_err());
+        assert_eq!(store.profile, desired);
+        assert!(store.flush_on_shutdown().is_err());
+        fs::remove_dir(&config).unwrap();
+        fs::rename(&previous, &config).unwrap();
+        store.save_if_due(now + Duration::from_secs(30)).unwrap();
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(store.error.is_some());
+        assert!(store.pending);
+        store.flush().unwrap();
+        assert!(!store.pending);
+        assert!(store.error.is_none());
+        assert_eq!(read_profile(&config).unwrap(), desired);
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn repeated_edit_rearms_failed_save_without_losing_writer_lock_guarantees() {
+        let config = temporary_config();
+        let mut owner = Store::load(config.clone());
+        owner.apply(Profile::default()).unwrap();
+        let mut store = Store::load(config.clone());
+        assert!(store.error.is_some());
+        let desired = complete_profile(-8.0);
+        let now = Instant::now();
+        store.update(desired.clone(), now).unwrap();
+        assert!(store.save_if_due(now + SAVE_DELAY).is_err());
+        assert_eq!(read_profile(&config).unwrap(), Profile::default());
+        drop(owner);
+        let retry = now + Duration::from_secs(5);
+        store.update(desired.clone(), retry).unwrap();
+        store
+            .save_if_due(retry + Duration::from_millis(1999))
+            .unwrap();
+        assert_eq!(read_profile(&config).unwrap(), Profile::default());
+        store.save_if_due(retry + SAVE_DELAY).unwrap();
+        assert_eq!(read_profile(&config).unwrap(), desired);
+        assert!(!store.pending);
+        assert!(store.error.is_none());
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unreadable_startup_is_not_saved_until_an_explicit_edit_and_backup_survives() {
+        let config = temporary_config();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&config)
+            .unwrap()
+            .write_all(b"preserve original")
+            .unwrap();
+        let mut store = Store::load(config.clone());
+        let now = Instant::now();
+        store.save_if_due(now + SAVE_DELAY).unwrap();
+        assert!(store.flush().is_err());
+        store.flush_on_shutdown().unwrap();
+        assert_eq!(fs::read(&config).unwrap(), b"preserve original");
+        store.update(Profile::default(), now).unwrap();
+        store.save_if_due(now + SAVE_DELAY).unwrap();
+        assert_eq!(read_profile(&config).unwrap(), Profile::default());
+        assert!(
+            fs::read_dir(config.parent().unwrap())
+                .unwrap()
+                .any(|entry| {
+                    let path = entry.unwrap().path();
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".invalid-")
+                        && fs::read(path).unwrap() == b"preserve original"
+                })
+        );
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn shutdown_flushes_the_latest_complete_profile_before_the_idle_deadline() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        let now = Instant::now();
+        store.update(complete_profile(-4.0), now).unwrap();
+        let latest = complete_profile(-11.0);
+        store.update(latest.clone(), now).unwrap();
+        assert!(!config.exists());
+        store.flush_on_shutdown().unwrap();
+        assert_eq!(read_profile(&config).unwrap(), latest);
+        assert!(!store.pending);
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn directory_sync_uncertainty_is_not_acknowledged_as_durable() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        let desired = complete_profile(-7.0);
+        store.update(desired.clone(), Instant::now()).unwrap();
+        assert!(
+            store
+                .finish_save(Ok(Some(
+                    "profile accepted but directory sync failed".into()
+                )))
+                .is_err()
+        );
+        assert!(store.pending);
+        assert!(store.error.is_some());
+        assert_eq!(store.profile, desired);
+        store.flush().unwrap();
+        assert_eq!(read_profile(&config).unwrap(), desired);
+        assert!(!store.pending);
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn corrupt_original_survives_explicit_apply_and_restart() {

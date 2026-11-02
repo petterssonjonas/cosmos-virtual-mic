@@ -239,7 +239,7 @@ Build optimized local test executables inside `cosmos`, after sourcing `dev-env.
 cargo build --workspace --release --locked
 ```
 
-Copy `target/release/cosmos-audio-mixer` and `target/release/cosmos-engine` into the same workstation directory, for example `~/.local/opt/cosmos-audio-mixer/`. Both are required: the GUI starts its sibling engine, and the engine also runs its own filter-host/meter subprocesses. These are raw development test executables, not a published Release or distribution package.
+Copy `target/release/cosmos-audio-mixer` and `target/release/cosmos-engine` into the same workstation directory, for example `~/.local/opt/cosmos-audio-mixer/`. Both are required: the GUI starts its sibling engine. The engine loads the native filter-chain and LV2 modules in its own process; it needs the `pipewire-module-filter-chain-lv2` and `lsp-plugins-lv2` runtime packages, not separate filter-host or meter executables. These are raw development test executables, not a published Release or distribution package.
 
 On the Fedora workstation, install runtime dependencies, not the compiler/development package list:
 

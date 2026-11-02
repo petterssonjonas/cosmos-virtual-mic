@@ -256,7 +256,7 @@ The GUI also rendered using Ubuntu 24.04's glibc 2.39 and Wayland libraries. Its
 
 Earlier real-widget simulations exercised input selection and measured audio/silence, OS-profile confirmation/cancel/off/restore, live sliders without mouse release, coalesced changes, and EQ/color restore. Evidence remains in `/var/tmp/cosmos-workstation-ui-4z7l_k4_` and `/var/tmp/cosmos-live-jxat2fse`. These are local test artifacts, not repository assets.
 
-`python3 tests/installer.py` checks verified staging, architecture/glibc/library rejection, path quoting, old-client stop, rollback, restart failure, ownership and retained settings. It uses an isolated service-manager fixture. The rendered user unit also passes `systemd-analyze --user verify`. A real isolated user manager cannot start in this toolbox: creating its `init.scope` fails with cgroup permission denied. Real start/enable/login restore must be checked on the workstation; no host cgroup or service settings were changed to bypass that limit.
+`bash -n install.sh` and `python3 tests/installer.py` check the Bash installer, native ELF startup, checksum rejection, old-client save/stop, automatic flat/versioned opt migration, updates, removal, failure backups, and retained settings. Python is test tooling only; installation and normal use do not require it. The tests use a private service-manager fixture, actual `systemd-analyze --user verify`, and GIO launcher parsing. A real isolated user manager cannot start in this toolbox because its cgroup is not delegated. Real service start/enable/login restore must be checked on the workstation; no host cgroup or service settings were changed.
 
 Desktop indicator rendering, launcher focus, physical devices, Bluetooth, independent clocks, latency and soak behavior still need workstation checks. AT-SPI/screen-reader operation remains unverified: the available launcher and pinned AccessKit use different enable-property names. Do not claim release readiness or universal desktop support.
 
@@ -276,86 +276,79 @@ For local development only, `cargo build --workspace --release --locked` builds 
 
 ### Install, update, and remove
 
-The verified bundle contains both executables, `install.sh`, the service/desktop/icon templates, `data/compatibility.conf`, and `SHA256SUMS`. This is a private workstation test bundle, not a published Release or distribution package. No package publishing or new distribution CI/CD was added.
+The bundle contains both executables, the Bash `install.sh`, service/desktop/icon templates, compatibility metadata and `SHA256SUMS`. This is a private test bundle, not a published Release. No distribution pipeline was added.
 
-Run the installer as the desktop user, never with sudo. It requires Python 3.9 or later, `getconf`, `ldd`, and a working systemd user manager. It checks hashes, ELF architecture, glibc and linked libraries before changing the install. Runtime-loaded Wayland/LV2 modules and LSP plugins still require the packages listed below; `ldd` does not validate them. The script does not run a package manager, change PipeWire/WirePlumber services, change system defaults, or enable lingering.
-
-```sh
-sha256sum -c SHA256SUMS
-./install.sh install --enable
-```
-
-`--enable` is explicit consent to start the engine now and at later user logins. Without it, a fresh install leaves the engine stopped and login startup disabled. Audio resumes when the user session and its PipeWire service are available, not before login. The frontend and indicator start when the user launches the app; the installer does not open a window at every login.
-
-Files go to `~/.local/opt/cosmos-audio-mixer/releases/`, selected through `current`. The user unit is under `$XDG_CONFIG_HOME/systemd/user/`; the desktop entry and independent icon are under `$XDG_DATA_HOME`. Default XDG paths are used when unset. Updates stage and verify both binaries before stopping the old engine, preserve the service's run/enable state, and attempt rollback on failure. A save failure blocks replacement. An unowned old install directory or standalone engine is not silently taken over.
+Quit the frontend first. Run as your desktop user, without sudo:
 
 ```sh
-# Update from a new downloaded bundle; preserve current startup/run choices.
-./install.sh install
-
-# Remove the managed binaries, launcher, icon and service. Keep mixer settings.
-"$HOME/.local/opt/cosmos-audio-mixer/current/install.sh" uninstall
+bash install.sh install --enable
 ```
 
-Uninstall retains `$XDG_CONFIG_HOME/cosmos-audio-mixer/` and its profiles/backups. The service restarts a failed engine with a two-second delay, limited to three starts in 30 seconds. After fixing a repeated startup failure, use `systemctl --user reset-failed cosmos-audio-mixer.service` before Start. Service stop sends SIGTERM; the final-save failure/timeout limit above still applies.
+The installer needs Bash, GNU coreutils, grep, `flock` and the systemd user manager. It has no Python dependency. It stages and checks the bundle, checks architecture, and runs both executables with `--help` before stopping the old engine. This detects loader/library failures without opening a window or audio connection. Native Wayland/LV2 modules and LSP plugins remain separate runtime prerequisites.
+
+The executables go directly in `~/.local/bin`. The user unit goes in `$XDG_CONFIG_HOME/systemd/user`; the desktop entry, themed icon and retained installer go under `$XDG_DATA_HOME`. Default XDG paths are used when unset. There are no release directories or JSON ownership database.
+
+Both earlier `~/.local/opt/cosmos-audio-mixer` layouts migrate automatically. The matching old client saves and stops a running engine before replacement. After a successful installation, the old directory is retained under a printed `.backup.*` path, including any unrelated files it contained. No manual move or marker file is needed. Custom service drop-ins that still reference the old opt path must be corrected first; the installer reports them before stopping anything.
+
+`--enable` starts the engine now and at user login. Without it, a fresh install leaves startup disabled; an update preserves existing startup choices and restarts an engine that was running. Only the engine starts at login. The indicator appears when the frontend is launched.
+
+```sh
+# Update from a newly downloaded bundle.
+bash install.sh install
+
+# Remove the executables and desktop/service integration, keeping settings.
+bash "${XDG_DATA_HOME:-$HOME/.local/share}/cosmos-audio-mixer/install.sh" uninstall
+```
+
+The script never writes or deletes mixer profiles. Save/stop failures prevent replacement. If a later file or service operation fails, it reports the error and retains previous files in the printed staging directory; it does not attempt automatic rollback. Resolve the error and rerun the installer. No new engine is started until all replacement files are installed. Existing service drop-ins and archived opt files are retained on removal.
+
+The service restarts a failed engine after two seconds, limited to three starts in 30 seconds. After correcting a repeated startup failure, run `systemctl --user reset-failed cosmos-audio-mixer.service` before Start. The script does not install packages, restart PipeWire/WirePlumber, change audio defaults or enable lingering.
 
 ### Copy from this server
 
-The corrected server test bundles are under `/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator-r2/`, with `x86_64` and `aarch64` subdirectories. The following commands are for the supplied Fedora 44 x86-64 workstation, in its normal desktop session:
+The Bash-installer bundles are at `/home/jp/Projects/cosmos-audio-mixer-test/bash-installer/{x86_64,aarch64}/`. The executables are unchanged from the verified `service-and-indicator-r2` build.
+
+For the Fedora 44 x86-64 workstation, run these commands there, not on the server:
 
 ```sh
-sudo dnf install python3 pipewire-libs pipewire-module-filter-chain-lv2 lsp-plugins-lv2 libxkbcommon 'libwayland-client.so.0()(64bit)'
+sudo dnf install pipewire-libs pipewire-module-filter-chain-lv2 lsp-plugins-lv2 libxkbcommon 'libwayland-client.so.0()(64bit)'
 mkdir -p "$HOME/Downloads"
-download=$(mktemp -d "$HOME/Downloads/cosmos-service.XXXXXX")
-scp -r jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator-r2/x86_64 "$download/"
+download=$(mktemp -d "$HOME/Downloads/cosmos-bash.XXXXXX")
+scp -r jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/bash-installer/x86_64 "$download/"
 cd "$download/x86_64"
 sha256sum -c SHA256SUMS
-```
-
-Close the old frontend first. If the previous executables were copied directly into `~/.local/opt/cosmos-audio-mixer/`, preserve that unowned directory before the first managed install:
-
-```sh
-(
-    set -eu
-    old="$HOME/.local/opt/cosmos-audio-mixer"
-    if [ -d "$old" ] && [ ! -f "$old/.cosmos-install.json" ]; then
-        test -x "$old/cosmos-engine"
-        if [ -S "${XDG_RUNTIME_DIR:?}/cosmos-audio-mixer/control.sock" ]; then
-            "$old/cosmos-engine" stop
-        fi
-        backup=$(mktemp -d "$HOME/.local/opt/cosmos-before-service.XXXXXX")
-        mv -- "$old" "$backup/files"
-        printf 'Old executables retained in %s/files\n' "$backup"
-    fi
-)
-```
-
-If that command fails, keep the old files and resolve the error before installing. The saved mixer profile is separate and is not moved. Then run:
-
-```sh
-./install.sh install --enable
+bash install.sh install --enable
 systemctl --user --no-pager status cosmos-audio-mixer.service
-"$HOME/.local/opt/cosmos-audio-mixer/current/cosmos-audio-mixer"
 ```
 
-The terminal launch remains attached to that terminal. Prefer the desktop application menu for normal use. In another terminal, follow service output with:
+If the `service-and-indicator-r2` bundle is already downloaded, only three small files need updating. From its `x86_64` directory:
+
+```sh
+scp jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/bash-installer/x86_64/{install.sh,SHA256SUMS,BUILD-INFO.json} .
+sha256sum -c SHA256SUMS &&
+bash install.sh install --enable
+```
+
+Stop if a command fails. There is no separate old-install migration command.
+
+Launch Cosmos Audio Mixer from the application menu, or run `"$HOME/.local/bin/cosmos-audio-mixer"` in a terminal. A terminal launch remains attached to that terminal. In another terminal, follow engine output with:
 
 ```sh
 journalctl --user -u cosmos-audio-mixer.service -f
 ```
 
-The launcher is also available in the desktop application menu. The default service log level is Warn. For Info/Debug, edit the user unit with `systemctl --user edit cosmos-audio-mixer.service`, clear `ExecStart=`, then set the installed engine command with `run --log-level info` or `debug`, reload and restart the service. A restart interrupts mixer audio; save successfully first.
+The default service log level is Warn. For Info/Debug, use `systemctl --user edit cosmos-audio-mixer.service`, clear `ExecStart=`, and set the installed `~/.local/bin/cosmos-engine` command with `run --log-level info` or `debug`. Use an absolute path, not a literal shell tilde. Reload and restart only after settings have saved; a restart interrupts mixer audio.
 
-GNOME needs a StatusNotifier/AppIndicator host. On Fedora:
+GNOME needs an indicator host:
 
 ```sh
 sudo dnf install gnome-shell-extension-appindicator
 gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
 ```
 
-If GNOME does not discover the newly installed extension, log out and back in, then enable it. The [extension](https://extensions.gnome.org/extension/615/appindicator-support/) is not required on a desktop that already supplies a working host.
+If GNOME does not discover the newly installed extension, log out and back in, then enable it. Other desktops with a StatusNotifier host do not need this extension.
 
-On Ubuntu 26.04, the equivalent native audio prerequisites include `pipewire`, `libpipewire-0.3-0t64`, `libspa-0.2-modules-extra`, `lsp-plugins-lv2`, `libxkbcommon0`, `libwayland-client0`, Python 3 and systemd. Ubuntu GNOME can use `gnome-shell-extension-appindicator`. No Rust toolchain, GTK4, COSMIC desktop or Toolbox is required to run these binaries.
+Ubuntu 26.04 audio prerequisites include `pipewire`, `libpipewire-0.3-0t64`, `libspa-0.2-modules-extra`, `lsp-plugins-lv2`, `libxkbcommon0` and `libwayland-client0`. Ubuntu GNOME can use `gnome-shell-extension-appindicator`. No Python, Rust toolchain, GTK4, COSMIC desktop or Toolbox is needed to install or run these binaries.
 
 ### Workstation acceptance
 

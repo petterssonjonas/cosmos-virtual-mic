@@ -10,7 +10,7 @@ use cosmos_control::{
     Response, VERSION,
 };
 
-use crate::discovery::Observed;
+use crate::discovery::{Connection, Observed};
 use crate::persistence::Store;
 
 const MAX_CLIENTS: usize = 8;
@@ -79,7 +79,9 @@ impl Client {
         observed: &mut Observed,
         store: &mut Store,
         reconcile: &mut impl FnMut(&Profile, &Observed) -> BackendStatus,
+        connection: Option<&Connection>,
         now: Instant,
+        stopping: &mut bool,
     ) -> io::Result<bool> {
         if now >= self.deadline {
             return Ok(false);
@@ -90,7 +92,9 @@ impl Client {
                 Ok(0) => return Ok(false),
                 Ok(length) => {
                     if length > MAX_REQUEST_BYTES.saturating_sub(self.input.len()) {
-                        self.reject(control::invalid("request exceeds control message limit"))?;
+                        let error = control::invalid("request exceeds control message limit");
+                        record_control_error(observed, "invalid control request", &error);
+                        self.reject(error)?;
                     } else {
                         self.input.extend_from_slice(&buffer[..length]);
                         match control::frame(&self.input, MAX_REQUEST_BYTES)
@@ -98,20 +102,71 @@ impl Client {
                         {
                             Ok(Some(request)) => {
                                 let response = match request.command {
-                                    Command::Stop => {
-                                        self.stopping = true;
-                                        Response::Stopping {
+                                    Command::Apply
+                                    | Command::Update
+                                    | Command::SetDeviceProfile
+                                        if *stopping =>
+                                    {
+                                        Response::Error {
                                             version: VERSION,
-                                            stopping: true,
+                                            error: "engine is stopping; changes are not accepted"
+                                                .into(),
+                                        }
+                                    }
+                                    Command::Stop => {
+                                        let result = store.flush_on_shutdown();
+                                        store.report_status(&mut observed.status);
+                                        match result {
+                                            Ok(()) => {
+                                                *stopping = true;
+                                                self.stopping = true;
+                                                Response::Stopping {
+                                                    version: VERSION,
+                                                    stopping: true,
+                                                }
+                                            }
+                                            Err(error) => {
+                                                record_control_error(
+                                                    observed,
+                                                    "cannot save profile before stop",
+                                                    &error,
+                                                );
+                                                Response::Error {
+                                                    version: VERSION,
+                                                    error: error.to_string(),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Command::Flush => {
+                                        let result = store.flush();
+                                        store.report_status(&mut observed.status);
+                                        match result {
+                                            Ok(()) => Response::Applied {
+                                                version: VERSION,
+                                                accepted: true,
+                                                status: observed.status.clone(),
+                                            },
+                                            Err(error) => {
+                                                record_control_error(
+                                                    observed,
+                                                    "cannot flush profile",
+                                                    &error,
+                                                );
+                                                Response::Error {
+                                                    version: VERSION,
+                                                    error: error.to_string(),
+                                                }
+                                            }
                                         }
                                     }
                                     Command::GetProfile => Response::Profile {
                                         version: VERSION,
                                         profile: store.profile.clone(),
                                     },
-                                    Command::Apply => {
+                                    Command::Apply | Command::Update => {
                                         let profile = request.profile.ok_or_else(|| {
-                                            control::invalid("apply requires a profile")
+                                            control::invalid("apply and update require a profile")
                                         })?;
                                         let validation =
                                             if observed.status.phase == control::Phase::Connected {
@@ -122,22 +177,60 @@ impl Client {
                                             } else {
                                                 Ok(())
                                             };
-                                        match validation.and_then(|()| store.apply(profile)) {
-                                            Ok(()) => {
-                                                observed.status.config_error = store.error.clone();
-                                                observed.status.backend =
-                                                    reconcile(&store.profile, observed);
-                                                Response::Applied {
-                                                    version: VERSION,
-                                                    accepted: true,
-                                                    status: observed.status.clone(),
-                                                }
+                                        let result = validation.and_then(|()| {
+                                            if request.command == Command::Update {
+                                                store.update(profile, Instant::now())
+                                            } else {
+                                                store.apply(profile)
                                             }
+                                        });
+                                        store.report_status(&mut observed.status);
+                                        // A rename followed by a directory-sync error may
+                                        // still have accepted new desired state.
+                                        observed.status.backend =
+                                            reconcile(&store.profile, observed);
+                                        match result {
+                                            Ok(()) => Response::Applied {
+                                                version: VERSION,
+                                                accepted: true,
+                                                status: observed.status.clone(),
+                                            },
                                             Err(error) => {
-                                                observed.status.config_error = store.error.clone();
+                                                record_control_error(
+                                                    observed,
+                                                    "cannot apply profile",
+                                                    &error,
+                                                );
                                                 Response::Error {
                                                     version: VERSION,
                                                     error: error.to_string(),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Command::SetDeviceProfile => {
+                                        let selection =
+                                            request.device_profile.ok_or_else(|| {
+                                                control::invalid(
+                                                    "set_device_profile requires device_profile",
+                                                )
+                                            })?;
+                                        let result = connection
+                                            .ok_or_else(|| "PipeWire is disconnected".to_owned())
+                                            .and_then(|connection| {
+                                                connection.set_device_profile(observed, selection)
+                                            });
+                                        match result {
+                                            Ok(change) => Response::DeviceProfile {
+                                                version: VERSION,
+                                                change,
+                                            },
+                                            Err(error) => {
+                                                observed.status.last_control_error =
+                                                    Some(error.clone());
+                                                Response::Error {
+                                                    version: VERSION,
+                                                    error,
                                                 }
                                             }
                                         }
@@ -150,12 +243,20 @@ impl Client {
                                         } else {
                                             Vec::new()
                                         },
+                                        devices: if command == Command::List {
+                                            observed.device_snapshot()
+                                        } else {
+                                            Vec::new()
+                                        },
                                     },
                                 };
                                 self.response(response)?;
                             }
                             Ok(None) => {}
-                            Err(error) => self.reject(error)?,
+                            Err(error) => {
+                                record_control_error(observed, "invalid control request", &error);
+                                self.reject(error)?;
+                            }
                         }
                     }
                 }
@@ -209,9 +310,12 @@ impl Server {
         &mut self,
         observed: &mut Observed,
         store: &mut Store,
+        connection: Option<&Connection>,
         mut reconcile: impl FnMut(&Profile, &Observed) -> BackendStatus,
     ) -> io::Result<bool> {
         let now = Instant::now();
+        observed.expire_device_profile(now);
+        store.report_status(&mut observed.status);
         if self.stopping_at.is_none() {
             for _ in 0..MAX_ACCEPTS_PER_TICK {
                 match self.socket.listener.accept() {
@@ -250,16 +354,31 @@ impl Server {
                 }
             }
         }
-        let mut received_stop = false;
+        let mut stopping = self.stopping_at.is_some();
         self.clients.retain_mut(|client| {
             // One failed/disconnected client must not stop the engine or other clients.
-            let keep = client
-                .poll(observed, store, &mut reconcile, now)
-                .unwrap_or(false);
-            received_stop |= client.stopping;
+            let keep = match client.poll(
+                observed,
+                store,
+                &mut reconcile,
+                connection,
+                now,
+                &mut stopping,
+            ) {
+                Ok(keep) => keep,
+                Err(error) => {
+                    record_control_error(observed, "control client failed", &error);
+                    false
+                }
+            };
+            stopping |= client.stopping;
             keep
         });
-        if received_stop && self.stopping_at.is_none() {
+        // Process accepted changes before checking the deadline, so a new value
+        // at the old deadline starts its own complete two-second idle interval.
+        let _ = store.save_if_due(Instant::now());
+        store.report_status(&mut observed.status);
+        if stopping && self.stopping_at.is_none() {
             self.stopping_at = Some(now);
         }
         if let Some(started) = self.stopping_at {
@@ -275,6 +394,218 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, DirBuilder};
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::fs::DirBuilderExt;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_config() -> PathBuf {
+        let directory = PathBuf::from("/var/tmp").join(format!(
+            "cosmos-control-save-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        DirBuilder::new().mode(0o700).create(&directory).unwrap();
+        directory.join("profile.json")
+    }
+
+    fn desired(alias: &str) -> Profile {
+        Profile {
+            devices: vec![control::DeviceSettings {
+                identity: [("node.name".into(), "fixture-source".into())].into(),
+                alias: alias.into(),
+                enabled: false,
+                hidden: true,
+                muted: true,
+            }],
+            ..Profile::default()
+        }
+    }
+
+    fn exchange(
+        command: Command,
+        profile: Option<Profile>,
+        store: &mut Store,
+        observed: &mut Observed,
+        stopping: &mut bool,
+        reconciled: &mut Vec<Profile>,
+    ) -> Response {
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_read_timeout(Some(SERVER_TIMEOUT)).unwrap();
+        let request = control::Request {
+            version: VERSION,
+            command,
+            profile,
+            device_profile: None,
+        };
+        peer.write_all(&control::encode(&request, MAX_REQUEST_BYTES).unwrap())
+            .unwrap();
+        let now = Instant::now();
+        let mut client = Client {
+            stream,
+            input: Vec::new(),
+            output: None,
+            written: 0,
+            deadline: now + SERVER_TIMEOUT,
+            stopping: false,
+        };
+        client
+            .poll(
+                observed,
+                store,
+                &mut |profile, _| {
+                    reconciled.push(profile.clone());
+                    BackendStatus::default()
+                },
+                None,
+                now,
+                stopping,
+            )
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(peer).read_line(&mut response).unwrap();
+        serde_json::from_str(&response).unwrap()
+    }
+
+    #[test]
+    fn update_reconciles_immediately_but_flush_and_stop_wait_for_durability() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        store.apply(Profile::default()).unwrap();
+        let mut observed = Observed::new();
+        let mut stopping = false;
+        let mut reconciled = Vec::new();
+        let first = desired("Live alias");
+        let response = exchange(
+            Command::Update,
+            Some(first.clone()),
+            &mut store,
+            &mut observed,
+            &mut stopping,
+            &mut reconciled,
+        );
+        assert!(matches!(
+            response,
+            Response::Applied {
+                accepted: true,
+                status: control::Status {
+                    config_pending: true,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(reconciled, vec![first.clone()]);
+        assert_eq!(
+            crate::persistence::read_profile(&config).unwrap(),
+            Profile::default()
+        );
+        let response = exchange(
+            Command::Flush,
+            None,
+            &mut store,
+            &mut observed,
+            &mut stopping,
+            &mut reconciled,
+        );
+        assert!(matches!(
+            response,
+            Response::Applied {
+                accepted: true,
+                status: control::Status {
+                    config_pending: false,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(crate::persistence::read_profile(&config).unwrap(), first);
+        let latest = desired("Final alias");
+        exchange(
+            Command::Update,
+            Some(latest.clone()),
+            &mut store,
+            &mut observed,
+            &mut stopping,
+            &mut reconciled,
+        );
+        assert!(matches!(
+            exchange(
+                Command::Stop,
+                None,
+                &mut store,
+                &mut observed,
+                &mut stopping,
+                &mut reconciled,
+            ),
+            Response::Stopping { stopping: true, .. }
+        ));
+        assert!(stopping);
+        assert_eq!(crate::persistence::read_profile(&config).unwrap(), latest);
+        for command in [Command::Update, Command::Apply] {
+            assert!(matches!(
+                exchange(
+                    command,
+                    Some(desired("Too late")),
+                    &mut store,
+                    &mut observed,
+                    &mut stopping,
+                    &mut reconciled,
+                ),
+                Response::Error { .. }
+            ));
+            assert_eq!(store.profile, latest);
+        }
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_flush_and_stop_leave_the_engine_open_for_recovery() {
+        let config = temporary_config();
+        let mut store = Store::load(config.clone());
+        let latest = desired("Unsaved alias");
+        store.update(latest.clone(), Instant::now()).unwrap();
+        fs::create_dir(&config).unwrap();
+        let mut observed = Observed::new();
+        let mut stopping = false;
+        let mut reconciled = Vec::new();
+        for command in [Command::Flush, Command::Stop] {
+            assert!(matches!(
+                exchange(
+                    command,
+                    None,
+                    &mut store,
+                    &mut observed,
+                    &mut stopping,
+                    &mut reconciled,
+                ),
+                Response::Error { .. }
+            ));
+            assert!(!stopping);
+            assert!(observed.status.config_pending);
+            assert!(observed.status.config_error.is_some());
+            assert_eq!(store.profile, latest);
+        }
+        fs::remove_dir(&config).unwrap();
+        assert!(matches!(
+            exchange(
+                Command::Stop,
+                None,
+                &mut store,
+                &mut observed,
+                &mut stopping,
+                &mut reconciled,
+            ),
+            Response::Stopping { stopping: true, .. }
+        ));
+        assert!(!observed.status.config_pending);
+        assert_eq!(crate::persistence::read_profile(&config).unwrap(), latest);
+        fs::remove_dir_all(config.parent().unwrap()).unwrap();
+    }
 
     #[test]
     fn accept_resource_and_connection_errors_are_recoverable_but_invalid_listeners_are_not() {

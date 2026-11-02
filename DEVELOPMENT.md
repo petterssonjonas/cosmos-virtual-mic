@@ -32,7 +32,7 @@ sudo dnf install "${packages[@]}"
 
 Installing these packages is not permission to start or enable another audio session manager against the host graph. Do not run `systemctl --user enable/start/restart pipewire` or WirePlumber setup commands as part of environment preparation. Toolbox can expose host session sockets and the host user service manager.
 
-This is the native dependency baseline. The Rust engine uses PipeWire 0.10.1 bindings with the `v1_2_0` API feature against native PipeWire 1.6.11. The native LV2 filter host links successfully to Lilv; direct Lilv development headers are not needed for this integration. The libcosmic application builds with this baseline, using Wayland and the software renderer. Do not install GTK4, Qt, Tauri, Node, Bun, or a full desktop environment for the frontend.
+The engine uses PipeWire 0.10.1 bindings with the `v1_0_0` API feature. Development verification uses native PipeWire 1.6.11 and LSP 1.2.29. The native LV2 filter host links to Lilv; direct Lilv development headers are not needed for this integration. The frontend uses Wayland and the software renderer. Do not install GTK4, Qt, Tauri, Node, Bun, or a full desktop environment for the frontend. The workstation compatibility baseline below is separate from this Fedora build environment.
 
 DNF resolves package versions from the enabled repositories. This file is NOT an RPM version lock. Development PR validation uses a pinned Fedora 45 toolbox image and records resolved RPM versions in its log; native repository contents are not frozen. Do not claim fully reproducible native dependencies yet.
 
@@ -64,7 +64,7 @@ Pinned and compiled libcosmic revision:
 
 Source: <https://github.com/pop-os/libcosmic/commit/95236a944bfd51c63a2fc65fe50a592c47168d40>
 
-The frontend manifest pins this revision and enables `wayland`, `tokio`, and `a11y`, without the default COSMIC configuration-service feature or an applet. `Cargo.lock` retains transitive Git revisions. The application builds with Rust 1.99.1. A private headless Weston session proves native window rendering without COSMIC services. This does not prove desktop-wide accessibility or compatibility with every compositor. No toolkit source fork or upstream submission was made.
+The frontend enables `wayland`, `tokio`, `a11y`, `single-instance`, and `multi-window`, without the default COSMIC configuration-service feature. The panel indicator uses `ksni` 0.3.7 and the StatusNotifierItem/D-BusMenu protocols, not a COSMIC-only applet. `Cargo.lock` retains transitive Git revisions. Private Weston checks prove native rendering without COSMIC services, not accessibility or compatibility with every compositor. No toolkit source fork or upstream submission was made.
 
 ## OMP, RTK, and agent skills
 
@@ -128,12 +128,25 @@ The workspace contains `cosmos-control` (toolkit-independent protocol, profile m
 cargo build --workspace --locked
 ./target/debug/cosmos-engine --help
 ./tests/engine-lifecycle.py
+python3 ./tests/device-profiles.py
 ./tests/backend-audio.py --keep
 ```
 
-The lifecycle test uses a private server and three synthetic nodes. It does not connect to desktop audio. It checks server absence, mono/stereo/unsupported layouts, duplicate descriptions, three server restarts, stale-node removal, duplicate engine rejection, slow/oversized clients, crash recovery, and explicit stop. It also checks that existing user files survive and that non-private socket directories are rejected.
+The lifecycle test uses a private server and three synthetic nodes. It does not connect to desktop audio. It checks server absence, mono/stereo/unsupported layouts, startup without discovery errors, duplicate descriptions, three server restarts, stale-node removal, duplicate engine rejection, slow/oversized clients, crash recovery, and explicit stop. It also checks that existing user files survive and that non-private socket directories are rejected.
 
-The executable accepts `run [--socket PATH] [--remote NAME] [--config PATH]`, `status|list|profile|stop [--socket PATH]`, and `apply FILE [--socket PATH]`. `run` stays in the foreground; launch it as a separate process when needed. Closing a control client does not stop it. Login startup is not installed or enabled. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, `run` connects to the default PipeWire server and restores the saved profile. An empty profile creates no audio path. Automated checks always use a private remote, runtime, HOME, and configuration.
+The executable accepts `run [--socket PATH] [--remote NAME] [--config PATH]`, `status|list|profile|flush|stop [--socket PATH]`, and `apply|update FILE [--socket PATH]`. `run` stays in the foreground, as required by the user service. Closing a client does not stop it. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, the engine connects to the default PipeWire server and restores the saved profile. An empty profile creates no audio path. Automated checks always use private runtime, HOME, configuration, and PipeWire instances.
+
+Both executables accept `--log-level error|warn|info|debug` and `--log-stdout`. The default is `warn` on stderr. Recoverable audio/configuration failures use `warn`; fatal executable failures use `error`. `info` adds startup, shutdown, connection and recovery messages. `debug` adds control/state details. Repeated unchanged failures do not print on each poll, messages are bounded, and audio callbacks do not write logs.
+
+```sh
+./target/debug/cosmos-audio-mixer --standalone --log-level info --log-stdout
+./target/debug/cosmos-engine run --log-level debug --log-stdout
+./target/debug/cosmos-engine status --log-level debug
+```
+
+The default GUI Start/Stop actions use `cosmos-audio-mixer.service`. Its output goes to the user journal; GUI logging flags do not change a running service's logging configuration. In `--standalone` mode, explicit GUI logging flags also apply to the sibling engine it starts, including redirected output. An already-running engine keeps its logging settings. JSON client commands reject `--log-stdout` so stdout remains valid JSON. Native libraries can still write to stderr.
+
+The control protocol is version 3. Update both executables together. The installer uses the old installed engine client to save and stop an existing managed engine before replacement. Saved mixer profiles remain version 1.
 
 Lifecycle invariants:
 
@@ -144,12 +157,13 @@ Lifecycle invariants:
 - Reconnect delay grows from 250 ms to at most 2 s. Handshake timeout is 2 s. Control requests remain available while PipeWire is absent.
 - IPC accepts at most eight active clients, 68 KiB requests, and 2 MiB responses. Complete serialized profiles are limited to 64 KiB. Server requests have a 1 s deadline; client operations have a 2 s absolute deadline. Stop has a bounded acknowledgement period.
 - Discovery reports identity candidates and channel semantics. Routing uses explicit selectors, never defaults or saved numeric IDs. Missing or ambiguous sources and unsupported layouts produce an error/unavailable state, not another microphone or a downmix.
+- Node `Format` and `EnumFormat` subscriptions follow the `SPA_PARAM_INFO_READ` flag. Subscription also starts enumeration, so an unreadable parameter must not be subscribed. When read access is removed, discovery clears the cached layout and ignores late parameter replies. Real I/O and permission errors remain visible.
 
 The locked dependency graph now includes libcosmic and its transitive Git dependencies, in addition to registry packages and the three local crates. The earlier 65-package backend-only inventory no longer describes this workspace. A complete licence/source/notice audit remains required before distribution.
 
 ### Profiles and processing
 
-`profile` returns the desired profile. `apply FILE` validates the complete replacement before saving or changing the graph. Acceptance means the desired state was saved; it does not mean that hardware, plugins, or links are ready. Check `status.backend` for bus and route states and `status.config_error` for persistence errors.
+`profile` returns the complete desired profile. `update FILE` validates and applies it immediately, then schedules a save after two seconds without a changed profile. An accepted Update can have `status.config_pending=true`; it is not a durability acknowledgement. `flush` saves pending state immediately. `apply FILE` is the durable administrative operation: it validates and saves before changing live state, except that a directory-sync failure after replacement must adopt the file already written. Check `status.backend`, `status.config_pending`, and `status.config_error`; accepted settings do not imply that hardware or routes are ready.
 
 The version-1 profile contains `buses`, `devices`, and `routes`. See `crates/control/src/model.rs` for the strict schema and bounds, and `tests/backend-audio.py` for runnable synthetic examples.
 
@@ -157,7 +171,7 @@ The version-1 profile contains `buses`, `devices`, and `routes`. See `crates/con
 - Each bus publishes `cosmos.bus.<id>.input` as a playback sink and `cosmos.bus.<id>.output` as a recording source. No system defaults change. Applications can use the input directly, or receive explicit engine-owned routes.
 - Supported effects are gate, compressor, one parametric EQ band per instance, and limiter. Multiple EQ instances form a multi-band chain. Gate controls include threshold, attack, hold, and release. Parameters use explicit dB, Hz, and milliseconds and must fit the installed native plugin ranges.
 - Parameter changes, volume, and mute use native live controls and retain endpoint identity. The volume stage is before a trailing limiter, or after the other effects when no trailing limiter exists. A separate final safety stage enforces exact silence for mute/unavailability. Disabling or removing the limiter removes its ceiling protection. Effect topology/channel changes safely replace the affected bus and can interrupt its clients. Endpoint logical names remain stable.
-- Device selectors use the identity properties from discovery. Device aliases, visibility, enable state, and mute stay local to this mixer. Hiding does not mute or disable. Hardware names, profiles, volume, and availability outside the mixer are not changed.
+- Device selectors use the identity properties from discovery. The saved profile's device aliases, visibility, enable state, and mute stay local to this mixer. Hiding does not mute or disable. These local settings do not change hardware names, profiles, volume, or availability outside the mixer. Separate, explicit system-profile actions are described below.
 - Routes connect selected hardware/application nodes and named buses. Validation rejects feedback and overlapping selector cycles before persistence. Resolved graph validation rejects identity aliases that would create a cycle.
 - Plugins run in the engine process, not the desktop PipeWire daemon. Native plugin failure can still terminate that engine process. No raw-audio fallback is created when required processing fails.
 - Input-feed and output meters report real per-channel linear peak/RMS values, sample counts, and freshness. They use bounded replaceable snapshots, not an event queue. Input metering follows actual incoming links; it does not rely on the native sink-monitor path. These values are not an exact LV2 gate-open or gain-reduction signal.
@@ -166,7 +180,11 @@ The version-1 profile contains `buses`, `devices`, and `routes`. See `crates/con
 
 The default profile is `$XDG_CONFIG_HOME/cosmos-audio-mixer/profile.json`, or `$HOME/.config/cosmos-audio-mixer/profile.json` when the XDG variable is absent. Use `--config` for an explicit private path. The directory must be private and user-owned; stored files are mode 0600. A separate persistent lock prevents two engines from writing the same profile.
 
-Saving writes and syncs a private temporary file, atomically replaces the profile, and syncs its directory. Corrupt or unsupported profiles are reported and are not silently overwritten. Explicit Apply preserves the invalid original with a no-replace backup rename before replacement. An interrupted backup leaves the original recoverable; a later Apply can complete recovery. A directory-sync error after replacement is reported separately because the new desired state was already accepted.
+The engine owns persistence, including when no frontend is open. It saves the complete profile after two seconds without a changed Update. Repeated identical updates do not postpone an active save deadline. Volume, mute, channel settings, routing, effect order and enable state, all effect parameters, tone-color EQ bands, and mixer-local device settings remain in the same profile.
+
+Saving writes and syncs a private temporary file, atomically replaces the profile, and syncs its directory. Corrupt or unsupported profiles are reported, not silently overwritten; explicit recovery preserves the invalid original with a no-replace backup rename. A failed autosave retains live state and a visible error, without a busy retry loop. Retry, a new edit, or an explicit Flush can retry the save.
+
+Frontend hide/quit drains pending edits and requires a successful Flush. Stop also requires a successful save. SIGINT/SIGTERM and fatal exits attempt a final save. A failed signal-triggered save keeps the engine alive and reports the error. This cannot protect unsaved RAM from power loss, SIGKILL, or systemd's 15-second stop timeout. Check save errors before shutdown; do not claim durability while `config_pending` is true.
 
 ### Backend verification
 
@@ -186,71 +204,162 @@ Verified paths include:
 
 Physical microphone hotplug, Bluetooth transitions, independent hardware clocks, end-to-end latency, and long-running resource growth still require separate authorized validation. The private tests do not capture a live microphone or change desktop audio.
 
+### System device profiles
+
+The Devices page discovers native PipeWire Device objects, including cards with profile `off` and no current input/output nodes. It shows the active profile, advertised profile choices, availability, and read/write limitations. Input/output labels on mixer endpoints describe audio direction relative to the mixer; an application playback stream is an input, and an application recording stream is an output.
+
+Choosing a system profile requires confirmation. **Off** disables the entire sound card for all applications, potentially removing both microphones and speakers. To restore it, select an available active profile from the same card. No prior/default profile is guessed. The OS may remember the choice; the native request sets `SPA_PARAM_PROFILE_save=true`. System profile actions are not stored in the mixer profile and are never applied automatically on startup, reconnect, or profile reload. The app does not set system defaults directly, but the session manager or other applications can react to device removal.
+
+The authenticated `SetDeviceProfile` command checks engine PID, connection generation, device ID, object serial, permissions and the advertised profile index. Acceptance is `pending`, not success. Native readback and a core barrier confirm the requested current state. Native request sequences keep late errors from a previous operation separate. Removal, disconnect, native rejection, or a five-second timeout produces a retained failure. The UI does not retry an uncertain OS action automatically; inspect the current profile before trying again.
+
+`python3 tests/device-profiles.py` compiles a small test-only SPA Device into a private temporary directory. It checks off/on input/output removal and restoration, stale PID/generation/serial rejection, unavailable/invalid profile rejection, native `EIO`, timeout, removal, disconnect, and saved-profile isolation. Rust tests also cover read/write access checks and delayed/superseded native replies. The synthetic test does not prove physical-card behavior or WirePlumber persistence across login/restart. Do not use host devices for automated fault injection.
+
 ## Native mixer frontend
 
 Run from a Wayland session inside `cosmos`, after sourcing `dev-env.sh`:
 
 ```sh
 cargo build --workspace --locked
-./target/debug/cosmos-audio-mixer
+./target/debug/cosmos-audio-mixer --standalone
 ```
 
-The GUI and `cosmos-engine` executable must be in the same directory. The window connects to an existing engine. If none is running, use **Start engine**. This is an explicit action, not a login service or an automatic crash-restart loop. The default engine launch creates its private control directory. `--socket PATH`, `--remote NAME`, and `--config PATH` select an explicit test or user configuration; an explicit socket requires an existing private parent directory.
+Normal launches use the installed systemd user service and a single frontend instance. **Start engine** starts that service; **Stop engine** first saves and stops the engine through its control socket, then stops the service. The GUI does not block while systemctl runs. `--standalone`, or any explicit `--socket`, `--remote`, or `--config`, selects direct sibling-engine control instead. Both executables must be in the same directory for direct control. An explicit socket needs an existing private parent directory. Custom/test launches do not join the desktop single instance.
 
 ### Controls
 
 - Add mono or stereo channel strips. No fixed bus names or automatic microphone routes are imposed.
 - Each strip has volume, noise-gate threshold, compressor threshold, effect enable controls, real input/output peak/RMS levels, mute, hide, and enable controls.
+- **Input**, below each channel name, selects a live incoming route. Existing routes made in Routing appear here. **No routed input** removes this channel's explicit incoming routes, not outgoing routes or direct application connections to its virtual endpoint. Replacing multiple incoming routes requires confirmation; use Routing to retain a multi-source mix. Missing saved sources remain visible, and invalid feedback edits are rolled back.
 - **Dynamics** opens gate threshold/attack/hold/release, compressor threshold/ratio/attack/release/makeup, and limiter ceiling/release controls. Effects can be added or removed.
 - **Equalizer** opens the channel's parametric bands with frequency, gain, Q, enable, add, and remove controls.
 - The tone-color pad controls 160 Hz warmth and 4.5 kHz brightness EQ bands, each within ±12 dB at Q 0.7. The popup has labelled slider alternatives and enable controls. This is ordinary EQ, not a copy of a proprietary algorithm. New channels include neutral color bands. A neutral reset does not add missing bands to an imported profile; the first non-neutral edit can add them and replace that channel's endpoints.
-- **Routing** selects explicit hardware/application/channel connections. **Devices** provides mixer-local aliases, visibility, mute, and participation controls. Unsupported layouts and unavailable resources remain visible.
+- **Routing** selects explicit hardware/application/channel connections. **Devices** separates system sound-card profiles from mixer-local aliases, visibility, mute, and participation controls. Input and output roles are labelled. Unsupported layouts and unavailable resources remain visible.
 - There are no recording, cassette, system-default, or login-startup controls.
 
-Controls are live. Valid slider, knob-equivalent, color-pad, checkbox, and routing changes are sent while the control is used, without an Apply button or a mouse-release requirement. Successful writes also save the profile. Adding/removing channels, effects, or routes can replace affected audio endpoints; destructive removals require confirmation. Parameter-only changes use existing endpoints. A saved profile does not mean every route is ready: read channel/route states and errors.
+Controls are live. Valid slider, color-pad, checkbox, and routing changes are sent while the control is used, without an Apply button or mouse-release requirement. Disk saves are separate and debounced. Adding/removing channels, effects, or routes can replace affected audio endpoints; destructive removals require confirmation. Parameter-only changes use existing endpoints. Saved settings do not mean every route is ready: read channel/route states and errors.
+
+GUI values snap to the control's declared step. The color pad uses the same 0.5 dB steps as its sliders; EQ frequency saves whole Hertz. Decimal steps are normalized before sending so settings contain values such as `1.3`, not floating-point step noise. Imported profiles, audio samples, meter calculations and test measurements are not rounded.
 
 Control I/O runs on a blocking worker, never the GUI event loop. Only one request is active. Later input replaces the pending desired state rather than building a queue of old slider positions. Acknowledgements update confirmed state without overwriting newer input. Due status/meter polls get a turn during sustained edits. Channel names remain separate drafts until Enter or a confirmed final save: renaming replaces channel endpoints, so it must not happen on every keystroke. Invalid names/aliases remain separate from the valid profile and cannot block other audio controls.
 
-Close, Stop engine, and Reload wait for pending writes. When stopped/offline, pending edits refuse those actions with a recovery message rather than waiting forever; Start remains available, and Reload can explicitly discard unsent edits when safe. Failures retain local changes and stop automatic write retries; **Retry pending changes** is recovery, not the normal control path. An uncertain write is reconciled against its exact sent profile. Conflicts require explicit discard-and-reload. Closing the window does not stop the engine. The GUI still checks the profile before each Apply protocol request, but that check and the write are not an atomic transaction across clients: use one editing client at a time.
+Close, Stop engine, and Reload wait for pending writes and the final disk save. Offline or failed saves retain edits and show recovery actions; Reload permits an explicit discard when safe. Failed writes do not retry continuously. Uncertain writes are reconciled against their exact sent profile. Conflicts require explicit discard-and-reload. The profile pre-check and Update are not atomic across clients: use one editing client at a time.
 
-### Frontend verification limits
+With a registered panel host, closing the window saves and hides it while the indicator remains. The panel menu provides Open, Hide, Start/Stop, and Quit. **Quit Mixer** saves and exits only the frontend. If no host is available, close exits after saving rather than hiding an inaccessible window. A lost panel host restores a hidden window. Launching the application again restores the existing window. The compositor controls focus; check launcher activation on the workstation.
 
-The real window rendered on a private headless Weston 15.0.1 compositor with no desktop audio connection. The session's existing Wayland socket returned `NoCompositor`. Weston tools were unpacked into a private temporary directory for verification, not installed into the host or toolbox baseline.
+### Verification and limits
 
-The final workspace passed formatting, locked debug and optimized builds, all 75 Rust tests, and Clippy with warnings denied. Both optimized executables ran `--help`. The GUI also rejected an unknown option and a missing socket argument with a non-zero status. The full backend audio/lifecycle scripts passed after the discovery correction; evidence is `/var/tmp/cosmos-backend-_28bevqy`. Its `selected-source-returned-status.json` shows a Ready bus with live meters and `discovery_error: null`. The optimized engine/filter-host also passed an isolated LV2, -12 dB live-gain, and exact-mute audio smoke at `/var/tmp/cosmos-release-smoke-t02use8k`.
+The integrated candidate passed formatting, locked builds, Clippy with warnings denied, and 126 Rust tests. Native lifecycle tests cover delayed saves, explicit flush, restart restore, signals, save failures and safe stop. The native device-profile tests and full backend audio harness also passed; current audio evidence is `/var/tmp/cosmos-backend-bkdobtdi`.
 
-A temporary simulator from the pinned iced revision exercised real widget pointer events, the application's update/tasks, and the actual private engine. The live-control smoke omitted mouse-release events and observed successive gain changes in synthetic audio, the latest value after an input burst, immediate mute, gate attenuation, EQ/color persistence, stable endpoints, and reopen. It also checked Enter-only name commit and recovery of edits made after Stop through the dialog's Start action. Evidence is at `/var/tmp/cosmos-live-jxat2fse`. Earlier smoke coverage included channel creation, EQ/dynamics popups, hide/mute, dirty-close cancellation, retained edits after a connection error, reload/reopen, and Start engine with an absent default socket directory. The simulator runs actual native widgets but does not replace normal-desktop/window-manager checks. Temporary smoke code and dependencies were removed.
+Private native Wayland/D-Bus checks covered indicator registration, hide/show, lost-host recovery, single-instance reopening, and final-save Quit with the engine still running. The final repeated hide/show and saved-control restore checks passed on Ubuntu 26.04's Weston 14.0.2, with live synthetic input/output levels. The actual GUI model produced short saved values for volume, color, compressor ratio and EQ frequency, and the engine restored them unchanged. Evidence and a final native capture are in `/var/tmp/cosmos-service-ui-02nf_b52`.
 
-Native rendering was also checked with synthetic audio on private PipeWire. `/var/tmp/cosmos-ui-ontunmpb/wayland-screenshot-2026-11-02_00-07-03.png` shows the controls and non-zero input/output meters before the discovery-status correction. The native window was restarted without replacing the engine. This capture exposed a stale discovery banner: a subscribed Format can be absent before negotiation, and a query can race object removal. The read-only discovery connection treated these `ENOENT` results as persistent failures. Discovery now treats them as graph changes, without replacing a real diagnostic or resetting the connection. This includes missing-object responses reported on the core. Permission errors and core transport failures retain their existing handling. The audio harness checks that normal source negotiation does not leave a discovery error. These checks do not verify physical devices or a screen reader.
+The GUI also rendered using Ubuntu 24.04's glibc 2.39 and Wayland libraries. Its older Weston 13 kiosk shell later crashed during a reopen cycle; the core trace was in libweston/kiosk-shell, and the engine kept running with the saved profile intact. Do not count that failed cycle as a pass or treat it as support for stock Ubuntu 24.04. The repeated final cycle used the supported newer compositor.
 
-The AT-SPI tree is not verified. The available accessibility launcher exposes `IsEnabled`, while the pinned AccessKit source listens for `ScreenReaderEnabled`. No fake accessibility service or toolkit patch was introduced. Screen-reader operation, real desktop keyboard/window-manager interaction, and the full hardware/soak responsiveness matrix remain release validation work.
+Earlier real-widget simulations exercised input selection and measured audio/silence, OS-profile confirmation/cancel/off/restore, live sliders without mouse release, coalesced changes, and EQ/color restore. Evidence remains in `/var/tmp/cosmos-workstation-ui-4z7l_k4_` and `/var/tmp/cosmos-live-jxat2fse`. These are local test artifacts, not repository assets.
 
-All private test audio/compositor processes were stopped after verification. Downloaded Weston packages and extracted tools were removed. Logs and screenshots were retained; no desktop audio services, defaults, or unrelated routes were changed.
+`python3 tests/installer.py` checks verified staging, architecture/glibc/library rejection, path quoting, old-client stop, rollback, restart failure, ownership and retained settings. It uses an isolated service-manager fixture. The rendered user unit also passes `systemd-analyze --user verify`. A real isolated user manager cannot start in this toolbox: creating its `init.scope` fails with cgroup permission denied. Real start/enable/login restore must be checked on the workstation; no host cgroup or service settings were changed to bypass that limit.
+
+Desktop indicator rendering, launcher focus, physical devices, Bluetooth, independent clocks, latency and soak behavior still need workstation checks. AT-SPI/screen-reader operation remains unverified: the available launcher and pinned AccessKit use different enable-property names. Do not claim release readiness or universal desktop support.
 
 ## Workstation test binaries
 
-The intended test workstation is Fedora 44 Workstation, x86-64, glibc 2.43. The server uses the Fedora 45 `cosmos` toolbox. Check the final binaries' symbol requirements before copying them; matching CPU architecture alone is not sufficient. Do not replace workstation glibc with server libraries.
+### Platform and dependency baseline
 
-The optimized x86-64 GUI requires symbols through `GLIBC_2.43`; the engine requires symbols through `GLIBC_2.34`. Both loaded successfully on the build system. These requirements match the supplied workstation glibc version, but actual Fedora 44 desktop, native-library, and audio behavior must still be tested there.
+The supplied architectures are **x86-64/amd64** and **aarch64/ARM64**. These are 64-bit Linux binaries, not 32-bit x86 or the x32 ABI. They require glibc, Wayland, PipeWire with its native LV2 host, LSP LV2 plugins, and a systemd user manager for managed mode. `--standalone` remains available without service integration.
 
-Build optimized local test executables inside `cosmos`, after sourcing `dev-env.sh`:
+The server update installed glibc 2.44. Do not copy a normal Fedora 45 build and assume it works on the Fedora 44 workstation's glibc 2.43. The test binaries were instead linked against verified Ubuntu 24.04 sysroots with the pinned Rust toolchain. Both GUI architectures require symbols through **GLIBC_2.39**; both engines require symbols through **GLIBC_2.34**. The bundle declares a common glibc floor of 2.39. Never replace the workstation's glibc with server libraries.
+
+**Stock Ubuntu support starts at 26.04**, not 24.04. Noble disables PipeWire LV2 support; installing only LSP cannot fix that. Resolute supplies the host in `libspa-0.2-modules-extra`. This was checked against signed package indexes and actual native processing, not version numbers alone. See the [Noble build rules](https://git.launchpad.net/ubuntu/+source/pipewire/plain/debian/rules?h=applied/ubuntu/noble-updates) and [Resolute build rules](https://git.launchpad.net/ubuntu/+source/pipewire/plain/debian/rules?h=applied/ubuntu/resolute).
+
+Ubuntu 26.04 runtime checks used glibc 2.43, PipeWire 1.6.2 and LSP 1.2.27. x86-64 mono/stereo processing passed. ARM64 native effects and live -6 dB gain passed under QEMU; this is not physical ARM latency evidence. Logs are at `/var/tmp/cosmos-ubuntu26-audio-mtw_3ww_` and `/var/tmp/cosmos-arm64-audio-bkun6l1_`. Other distributions need the same runtime facilities and their own validation; a glibc number alone does not prove audio support.
+
+For local development only, `cargo build --workspace --release --locked` builds against the current toolbox. Portable delivery must use the older sysroot and target compiler, then check ELF architecture, versioned symbols, and actual runtime behavior. Do not raise the portable ABI floor by silently using host libraries.
+
+### Install, update, and remove
+
+The verified bundle contains both executables, `install.sh`, the service/desktop/icon templates, `data/compatibility.conf`, and `SHA256SUMS`. This is a private workstation test bundle, not a published Release or distribution package. No package publishing or new distribution CI/CD was added.
+
+Run the installer as the desktop user, never with sudo. It requires Python 3.9 or later, `getconf`, `ldd`, and a working systemd user manager. It checks hashes, ELF architecture, glibc and linked libraries before changing the install. Runtime-loaded Wayland/LV2 modules and LSP plugins still require the packages listed below; `ldd` does not validate them. The script does not run a package manager, change PipeWire/WirePlumber services, change system defaults, or enable lingering.
 
 ```sh
-cargo build --workspace --release --locked
+sha256sum -c SHA256SUMS
+./install.sh install --enable
 ```
 
-Copy `target/release/cosmos-audio-mixer` and `target/release/cosmos-engine` into the same workstation directory, for example `~/.local/opt/cosmos-audio-mixer/`. Both are required: the GUI starts its sibling engine. The engine loads the native filter-chain and LV2 modules in its own process; it needs the `pipewire-module-filter-chain-lv2` and `lsp-plugins-lv2` runtime packages, not separate filter-host or meter executables. These are raw development test executables, not a published Release or distribution package.
+`--enable` is explicit consent to start the engine now and at later user logins. Without it, a fresh install leaves the engine stopped and login startup disabled. Audio resumes when the user session and its PipeWire service are available, not before login. The frontend and indicator start when the user launches the app; the installer does not open a window at every login.
 
-On the Fedora workstation, install runtime dependencies, not the compiler/development package list:
+Files go to `~/.local/opt/cosmos-audio-mixer/releases/`, selected through `current`. The user unit is under `$XDG_CONFIG_HOME/systemd/user/`; the desktop entry and independent icon are under `$XDG_DATA_HOME`. Default XDG paths are used when unset. Updates stage and verify both binaries before stopping the old engine, preserve the service's run/enable state, and attempt rollback on failure. A save failure blocks replacement. An unowned old install directory or standalone engine is not silently taken over.
 
 ```sh
-sudo dnf install pipewire-libs pipewire-module-filter-chain-lv2 lsp-plugins-lv2 libxkbcommon 'libwayland-client.so.0()(64bit)'
-chmod +x ~/.local/opt/cosmos-audio-mixer/cosmos-audio-mixer ~/.local/opt/cosmos-audio-mixer/cosmos-engine
-ldd ~/.local/opt/cosmos-audio-mixer/cosmos-audio-mixer
-ldd ~/.local/opt/cosmos-audio-mixer/cosmos-engine
-~/.local/opt/cosmos-audio-mixer/cosmos-audio-mixer
+# Update from a new downloaded bundle; preserve current startup/run choices.
+./install.sh install
+
+# Remove the managed binaries, launcher, icon and service. Keep mixer settings.
+./install.sh uninstall
 ```
 
-Launch from the normal Wayland desktop session, not with sudo. Use the workstation's existing PipeWire/WirePlumber services; do not start another session manager or change audio defaults. The `ldd` output must have no missing libraries or version errors. Runtime-loaded Wayland, filter-chain, and LV2 modules also need the packages above; `ldd` alone cannot verify these modules. No Rust toolchain, GTK4, COSMIC desktop, or Toolbox is required on the workstation.
+Uninstall retains `$XDG_CONFIG_HOME/cosmos-audio-mixer/` and its profiles/backups. The service restarts a failed engine with a two-second delay, limited to three starts in 30 seconds. After fixing a repeated startup failure, use `systemctl --user reset-failed cosmos-audio-mixer.service` before Start. Service stop sends SIGTERM; the final-save failure/timeout limit above still applies.
 
-For first use, start the engine from the window, add a mono or stereo channel, and select the intended connections in Routing. Begin at low volume. Verify volume while dragging, mute, gate, compressor, EQ, and tone color with known audio. Closing/reopening must retain settings and leave the engine running. Use **Stop engine** when testing is complete.
+### Copy from this server
+
+The server test bundles are under `/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator/`, with `x86_64` and `aarch64` subdirectories. The following commands are for the supplied Fedora 44 x86-64 workstation, in its normal desktop session:
+
+```sh
+sudo dnf install python3 pipewire-libs pipewire-module-filter-chain-lv2 lsp-plugins-lv2 libxkbcommon 'libwayland-client.so.0()(64bit)'
+mkdir -p "$HOME/Downloads"
+download=$(mktemp -d "$HOME/Downloads/cosmos-service.XXXXXX")
+scp -r jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator/x86_64 "$download/"
+cd "$download/x86_64"
+sha256sum -c SHA256SUMS
+```
+
+Close the old frontend first. If the previous executables were copied directly into `~/.local/opt/cosmos-audio-mixer/`, preserve that unowned directory before the first managed install:
+
+```sh
+(
+    set -eu
+    old="$HOME/.local/opt/cosmos-audio-mixer"
+    if [ -d "$old" ] && [ ! -f "$old/.cosmos-install.json" ]; then
+        test -x "$old/cosmos-engine"
+        if [ -S "${XDG_RUNTIME_DIR:?}/cosmos-audio-mixer/control.sock" ]; then
+            "$old/cosmos-engine" stop
+        fi
+        backup=$(mktemp -d "$HOME/.local/opt/cosmos-before-service.XXXXXX")
+        mv -- "$old" "$backup/files"
+        printf 'Old executables retained in %s/files\n' "$backup"
+    fi
+)
+```
+
+If that command fails, keep the old files and resolve the error before installing. The saved mixer profile is separate and is not moved. Then run:
+
+```sh
+./install.sh install --enable
+systemctl --user --no-pager status cosmos-audio-mixer.service
+"$HOME/.local/opt/cosmos-audio-mixer/current/cosmos-audio-mixer"
+```
+
+The terminal launch remains attached to that terminal. Prefer the desktop application menu for normal use. In another terminal, follow service output with:
+
+```sh
+journalctl --user -u cosmos-audio-mixer.service -f
+```
+
+The launcher is also available in the desktop application menu. The default service log level is Warn. For Info/Debug, edit the user unit with `systemctl --user edit cosmos-audio-mixer.service`, clear `ExecStart=`, then set the installed engine command with `run --log-level info` or `debug`, reload and restart the service. A restart interrupts mixer audio; save successfully first.
+
+GNOME needs a StatusNotifier/AppIndicator host. On Fedora:
+
+```sh
+sudo dnf install gnome-shell-extension-appindicator
+gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+```
+
+If GNOME does not discover the newly installed extension, log out and back in, then enable it. The [extension](https://extensions.gnome.org/extension/615/appindicator-support/) is not required on a desktop that already supplies a working host.
+
+On Ubuntu 26.04, the equivalent native audio prerequisites include `pipewire`, `libpipewire-0.3-0t64`, `libspa-0.2-modules-extra`, `lsp-plugins-lv2`, `libxkbcommon0`, `libwayland-client0`, Python 3 and systemd. Ubuntu GNOME can use `gnome-shell-extension-appindicator`. No Rust toolchain, GTK4, COSMIC desktop or Toolbox is required to run these binaries.
+
+### Workstation acceptance
+
+At low volume, check live volume, mute, gate, compressor, EQ and tone color. Wait two seconds, then check restore. Also change a setting and immediately close/quit: it must save without waiting for the idle timer. With the panel host, close hides and Open restores; Quit removes only the frontend. Test service stop/start and logout/login restore, including every effect's parameters and enable state. Confirm launcher focus and panel rendering. Do not merge the PR until the owner approves these workstation results.
+
+System card profiles remain OS-owned; the mixer does not replay a destructive OS profile action on startup. Test Off/restore only on a card that you intend to change for all applications. No installation command should restart desktop audio services or change audio defaults.
+

@@ -2,11 +2,27 @@
 
 ## Resume here
 
-Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside the `cosmos` toolbox and source `dev-env.sh` before Rust commands. The main checkout is `/home/jp/Projects/cosmos-audio-mixer`. Current frontend work is in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/native-mixer`, on `feature/native-mixer`, based on refreshed `origin/development`. The main checkout's pre-existing `.gitignore` change was left untouched.
+Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside `cosmos` and source `dev-env.sh` before Rust commands. Continue in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/mixer-inputs-and-diagnostics`, branch `feature/mixer-inputs-and-diagnostics`, based on `origin/development` at `46aa805bdcdc54877aa39f38f3ef8added0f286a`. Do not leave this worktree. The main checkout's unrelated `.gitignore` change remains untouched.
 
 The Rust backend hosts native LSP DSP, named playback/recording endpoints, explicit routes, real input/output levels, and validated persistent profiles. The native libcosmic frontend is implemented. Physical hardware, latency, clock drift, desktop accessibility, and long-running reliability remain release validation work; do not claim release readiness.
 
-## Native frontend — 2026-11-02
+## Service, persistence, and panel candidate — 2026-11-02
+
+- Current authorization: create a new PR to `development` and provide compiled workstation test bundles. **Do not merge until the owner tests and approves.** Earlier merge authorization below is history, not current permission. Do not add package publishing or distribution CI/CD yet.
+- The default frontend controls `cosmos-audio-mixer.service`. `--standalone` or explicit socket/remote/config options use direct sibling-engine control. The engine remains independent of the frontend and restores its complete saved mixer profile.
+- Controls remain live. Protocol-3 Update changes audio now and debounces complete-profile persistence for two seconds. Flush, frontend close/hide/quit, and Stop require a durable save. Signals and fatal exits attempt a final save. Failed saves retain live state and an error; forced termination or power loss can still lose unsaved RAM.
+- GUI values snap to useful steps, including 0.5 dB color movement and whole-Hertz EQ frequency. Decimal controls save concise values. Imported settings, DSP samples and measured levels retain their precision.
+- Native StatusNotifierItem/D-BusMenu provides Open, Hide, Start/Stop and Quit. Window close hides only with a registered host; host loss restores the window. Quit leaves the engine running. Normal launches use one frontend instance.
+- `install.sh install [--enable]` installs or updates versioned per-user binaries, service, desktop entry and icon. `--enable` opts into current start and login startup. `uninstall` removes only the owned install/integration and keeps profiles. Staging checks immutable hashes, architecture, glibc and linked libraries; rollback preserves run/enable state. Native LV2 runtime packages are separate prerequisites.
+- The bundle ABI floor is glibc 2.39 for x86-64 and ARM64, built with Ubuntu 24.04 sysroots rather than the updated server's glibc 2.44. Stock Ubuntu support starts at 26.04: 24.04 disables LV2. Ubuntu 26 requires `libspa-0.2-modules-extra`. Actual Ubuntu 26 mono/stereo audio passed; ARM64 effects and live gain passed under QEMU, not physical ARM hardware.
+- The current work also includes terminal logging flags, per-strip Input routing, input/output labels, confirmed system-card profile controls, and the readable-Format discovery correction. Protocol version is 3; saved profile version stays 1. Replace both executables together through the installer.
+- Verification: 126 Rust tests, formatting, Clippy, locked builds, native persistence/lifecycle/device-profile tests, full backend audio, installer failure/rollback regressions, and rendered user-unit verification. Native Wayland/D-Bus tests passed hide/show, lost-host recovery, single-instance reopening and final-save Quit without stopping the engine. The final repeated native cycle and snapped-profile restart passed on Weston 14.0.2. An older Weston 13 kiosk shell crashed in an earlier cycle; the engine continued and kept its saved settings.
+- A real private systemd user manager cannot run in this toolbox because its cgroup is not delegated. Do not change host/podman settings to bypass this. Real service start/enable/login restore, GNOME indicator rendering and launcher focus remain workstation acceptance checks.
+- Test bundles: `/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator/{x86_64,aarch64}/`. `DEVELOPMENT.md` gives workstation-side scp, dependency, old-flat-install backup, install/update/uninstall, service and journal commands. SSH server address observed here is `jp@192.168.0.2`. Keep profiles and old unmanaged binaries; do not delete them as cleanup.
+
+Current local evidence: `/var/tmp/cosmos-backend-bkdobtdi`, `/var/tmp/cosmos-service-ui-02nf_b52`, `/var/tmp/cosmos-ubuntu26-audio-mtw_3ww_`, and `/var/tmp/cosmos-arm64-audio-bkun6l1_`. These paths are test artifacts, not source assets or release packages.
+
+## Native frontend — 2026-11-02 (historical)
 
 - Added `crates/mixer`, package/executable `cosmos-audio-mixer`, pinned to libcosmic `95236a944bfd51c63a2fc65fe50a592c47168d40`. The engine and control crates remain toolkit-independent.
 - Added mono/stereo channel strips with volume, gate/compressor threshold and enable controls, full dynamics popup, per-channel parametric EQ popup, real input/output meters, and independent mute/hide/enable controls.
@@ -27,10 +43,10 @@ Launch from the feature worktree after sourcing `dev-env.sh`:
 
 ```sh
 cargo build --workspace --locked
-./target/debug/cosmos-audio-mixer
+./target/debug/cosmos-audio-mixer --standalone
 ```
 
-The repository now has `origin`. SSH authentication was unavailable in this session; HTTPS with the installed `gh` credential helper worked without global credential changes. The user authorized a reviewed PR and squash merge to `development` after validation, not a merge to `main` or a published Release. Consult the PR and its checks for hosted state.
+The repository has `origin`. Earlier sessions used HTTPS with the installed `gh` credential helper when SSH authentication was unavailable, without global credential changes. Earlier frontend merge authorization applied to that delivery only. The current service/panel candidate must remain unmerged pending workstation approval.
 
 The workstation target is Fedora 44 Workstation, x86-64, glibc 2.43. Prefer copying both optimized test executables together and installing native runtime dependencies; see `DEVELOPMENT.md`. This is private development testing, not distribution packaging. Do not replace workstation glibc or change host audio defaults.
 

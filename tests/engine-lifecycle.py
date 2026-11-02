@@ -3,6 +3,7 @@
 """Exercise the real engine against a private PipeWire server, never host audio."""
 import json
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import tempfile
@@ -103,9 +104,9 @@ def main():
                 processes.append(process)
                 return process
 
-            def command(action):
+            def command(action, *args):
                 result = subprocess.run(
-                    [str(BINARY), action, "--socket", str(ipc)], env=env,
+                    [str(BINARY), action, *map(str, args), "--socket", str(ipc)], env=env,
                     capture_output=True, text=True, timeout=3, check=True)
                 return json.loads(result.stdout)
 
@@ -161,7 +162,8 @@ def main():
                             assert node["generation"] == generation, node
                         return result
 
-                    eventually(discovered)
+                    discovered_nodes = eventually(discovered)
+                    assert discovered_nodes["status"]["discovery_error"] is None, discovered_nodes
                     assert command("status")["status"]["pid"] == engine.pid
                     terminate(daemon)
                     disconnected = eventually(lambda: phase("disconnected"))
@@ -183,6 +185,71 @@ def main():
                     except (BrokenPipeError, ConnectionResetError):
                         pass
                 assert command("status")["status"]["pid"] == engine.pid
+
+                # Live edits persist complete desired state only after the idle
+                # deadline or an explicit final action. No physical audio is used.
+                config = Path(env["XDG_CONFIG_HOME"]) / "cosmos-audio-mixer/profile.json"
+                request = directory / "requested-profile.json"
+                desired = {
+                    "version": 1, "buses": [], "routes": [],
+                    "devices": [{
+                        "identity": {"node.name": "fixture-not-present"},
+                        "alias": "Live alias", "enabled": False,
+                        "hidden": True, "muted": True,
+                    }],
+                }
+
+                def update(alias):
+                    desired["devices"][0]["alias"] = alias
+                    request.write_text(json.dumps(desired))
+                    result = command("update", request)
+                    assert result["accepted"] and result["status"]["config_pending"], result
+                    assert command("profile")["profile"] == desired
+
+                assert not config.exists(), "Startup wrote default configuration"
+                update("First live alias")
+                time.sleep(1.1)
+                assert not config.exists(), "Live update saved before two idle seconds"
+                update("Latest complete alias")
+                time.sleep(1.1)
+                assert not config.exists(), "New edit did not reset the idle deadline"
+                eventually(lambda: not command("status")["status"]["config_pending"])
+                assert json.loads(config.read_text()) == desired
+                for shutdown_signal in (signal.SIGINT, signal.SIGTERM):
+                    update(f"Saved before signal {shutdown_signal}")
+                    engine.send_signal(shutdown_signal)
+                    assert engine.wait(timeout=4) == 0
+                    assert json.loads(config.read_text()) == desired
+                    engine = launch(str(BINARY), "run", "--socket", str(ipc))
+                    eventually(lambda: phase("disconnected"))
+                    assert command("profile")["profile"] == desired
+
+                durable = config.read_bytes()
+                update("Retained after failed save")
+                previous = config.with_suffix(".previous")
+                config.rename(previous)
+                config.mkdir(mode=0o700)
+                eventually(lambda: command("status")["status"]["config_error"])
+                engine.send_signal(signal.SIGTERM)
+                time.sleep(0.2)
+                assert engine.poll() is None, "Failed signal flush discarded live state"
+                refused = subprocess.run(
+                    [str(BINARY), "stop", "--socket", str(ipc)], env=env,
+                    capture_output=True, timeout=3)
+                assert refused.returncode != 0, "Failed stop flush was acknowledged"
+                assert command("profile")["profile"] == desired
+                config.rmdir()
+                previous.rename(config)
+                time.sleep(2.2)
+                status = command("status")["status"]
+                assert status["config_pending"] and status["config_error"], status
+                assert config.read_bytes() == durable, "Failed save busy-retried without permission"
+                flushed = command("flush")
+                assert flushed["accepted"] and not flushed["status"]["config_pending"], flushed
+                assert flushed["status"]["config_error"] is None, flushed
+                assert json.loads(config.read_text()) == desired
+                print("Persistence: idle debounce, complete restore, signal flush, failed stop "
+                      "and explicit retry")
                 engine.kill()
                 engine.wait(timeout=4)
                 engine = launch(str(BINARY), "run", "--socket", str(ipc))

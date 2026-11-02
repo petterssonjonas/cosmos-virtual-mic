@@ -8,5 +8,7 @@ license.workspace = true
 
 [dependencies]
 cosmos-control = { path = "../control" }
-libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "95236a944bfd51c63a2fc65fe50a592c47168d40", default-features = false, features = ["wayland", "tokio", "a11y"] }
-tokio = { version = "1", features = ["rt", "time"] }
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "95236a944bfd51c63a2fc65fe50a592c47168d40", default-features = false, features = ["wayland", "tokio", "a11y", "single-instance", "multi-window"] }
+ksni = "=0.3.7"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }

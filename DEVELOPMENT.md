@@ -136,7 +136,7 @@ The lifecycle test uses a private server and three synthetic nodes. It does not 
 
 The executable accepts `run [--socket PATH] [--remote NAME] [--config PATH]`, `status|list|profile|flush|stop [--socket PATH]`, and `apply|update FILE [--socket PATH]`. `run` stays in the foreground, as required by the user service. Closing a client does not stop it. The default socket is `$XDG_RUNTIME_DIR/cosmos-audio-mixer/control.sock`. Without an explicit remote or `PIPEWIRE_REMOTE`, the engine connects to the default PipeWire server and restores the saved profile. An empty profile creates no audio path. Automated checks always use private runtime, HOME, configuration, and PipeWire instances.
 
-Both executables accept `--log-level error|warn|info|debug` and `--log-stdout`. The default is `warn` on stderr. Recoverable audio/configuration failures use `warn`; fatal executable failures use `error`. `info` adds startup, shutdown, connection and recovery messages. `debug` adds control/state details. Repeated unchanged failures do not print on each poll, messages are bounded, and audio callbacks do not write logs.
+Both executables accept `--log-level error|warn|info|debug` and `--log-stdout`. The default is `warn` on stderr. Recoverable audio/configuration failures use `warn`; fatal executable failures use `error`. `info` adds startup, shutdown, connection and recovery messages. `debug` adds control/state details. Repeated unchanged engine/control failures do not print on each poll, application messages are bounded, and audio callbacks do not write logs.
 
 ```sh
 ./target/debug/cosmos-audio-mixer --standalone --log-level info --log-stdout
@@ -144,7 +144,7 @@ Both executables accept `--log-level error|warn|info|debug` and `--log-stdout`. 
 ./target/debug/cosmos-engine status --log-level debug
 ```
 
-The default GUI Start/Stop actions use `cosmos-audio-mixer.service`. Its output goes to the user journal; GUI logging flags do not change a running service's logging configuration. In `--standalone` mode, explicit GUI logging flags also apply to the sibling engine it starts, including redirected output. An already-running engine keeps its logging settings. JSON client commands reject `--log-stdout` so stdout remains valid JSON. Native libraries can still write to stderr.
+The default GUI Start/Stop actions use `cosmos-audio-mixer.service`. Its output goes to the user journal; GUI logging flags do not change a running service's logging configuration. In `--standalone` mode, explicit GUI logging flags also apply to the sibling engine it starts, including redirected output. An already-running engine keeps its logging settings. JSON client commands reject `--log-stdout` so stdout remains valid JSON. Native libraries and windowing dependencies can still write repeated messages to stderr; the application logger does not suppress them.
 
 The control protocol is version 3. Update both executables together. The installer uses the old installed engine client to save and stop an existing managed engine before replacement. Saved mixer profiles remain version 1.
 
@@ -294,20 +294,20 @@ Files go to `~/.local/opt/cosmos-audio-mixer/releases/`, selected through `curre
 ./install.sh install
 
 # Remove the managed binaries, launcher, icon and service. Keep mixer settings.
-./install.sh uninstall
+"$HOME/.local/opt/cosmos-audio-mixer/current/install.sh" uninstall
 ```
 
 Uninstall retains `$XDG_CONFIG_HOME/cosmos-audio-mixer/` and its profiles/backups. The service restarts a failed engine with a two-second delay, limited to three starts in 30 seconds. After fixing a repeated startup failure, use `systemctl --user reset-failed cosmos-audio-mixer.service` before Start. Service stop sends SIGTERM; the final-save failure/timeout limit above still applies.
 
 ### Copy from this server
 
-The server test bundles are under `/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator/`, with `x86_64` and `aarch64` subdirectories. The following commands are for the supplied Fedora 44 x86-64 workstation, in its normal desktop session:
+The corrected server test bundles are under `/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator-r2/`, with `x86_64` and `aarch64` subdirectories. The following commands are for the supplied Fedora 44 x86-64 workstation, in its normal desktop session:
 
 ```sh
 sudo dnf install python3 pipewire-libs pipewire-module-filter-chain-lv2 lsp-plugins-lv2 libxkbcommon 'libwayland-client.so.0()(64bit)'
 mkdir -p "$HOME/Downloads"
 download=$(mktemp -d "$HOME/Downloads/cosmos-service.XXXXXX")
-scp -r jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator/x86_64 "$download/"
+scp -r jp@192.168.0.2:/home/jp/Projects/cosmos-audio-mixer-test/service-and-indicator-r2/x86_64 "$download/"
 cd "$download/x86_64"
 sha256sum -c SHA256SUMS
 ```

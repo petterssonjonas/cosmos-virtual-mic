@@ -397,7 +397,16 @@ impl Control {
                     // A failed Apply was not accepted. Keep its error and require an
                     // explicit retry, rather than repeatedly writing on every poll.
                     self.uncertain = None;
-                } else if !self.needs_save() && !self.blocked {
+                } else if !self.pending()
+                    && !self.blocked
+                    && (!self.disk_pending
+                        || self
+                            .status
+                            .as_ref()
+                            .is_some_and(|previous| previous.pid == snapshot.status.pid))
+                {
+                    // A connected engine owns its deferred saves. After engine loss,
+                    // keep accepted but unsaved settings instead of adopting older disk state.
                     self.profile = (*observed).clone();
                     self.baseline = Some(observed);
                     self.text_edits.prune(&self.profile);
@@ -1298,6 +1307,28 @@ mod tests {
     }
 
     #[test]
+    fn external_profile_is_adopted_while_only_the_engine_save_is_pending() {
+        let mut control = connected();
+        gain(&mut control, -6.0);
+        take_apply(&mut control);
+        acknowledge(&mut control);
+        assert!(!control.pending());
+        assert!(control.needs_save());
+
+        let mut external = control.profile.clone();
+        external.buses[0].muted = true;
+        control.tick();
+        assert!(matches!(
+            control.next(),
+            Some(Next::Request(Operation::Poll))
+        ));
+        assert!(control.finish(observed(external.clone(), 2)));
+        assert_eq!(control.profile, external);
+        assert!(!control.save_blocked());
+        assert!(!control.needs_save());
+    }
+
+    #[test]
     fn reconnect_with_an_external_profile_preserves_pending_edits_as_a_conflict() {
         let mut control = connected();
         let mut external = control.profile.clone();
@@ -1607,6 +1638,30 @@ mod tests {
         flush(&mut control);
         assert!(!control.needs_save());
         assert!(!matches!(control.next(), Some(Next::Close)));
+    }
+
+    #[test]
+    fn engine_restart_between_polls_keeps_accepted_but_unsaved_settings() {
+        let mut control = connected();
+        let saved = control.profile.clone();
+        gain(&mut control, -15.0);
+        take_apply(&mut control);
+        acknowledge(&mut control);
+        control.tick();
+        assert!(matches!(
+            control.next(),
+            Some(Next::Request(Operation::Poll))
+        ));
+        let mut restarted = status(2);
+        restarted.pid += 1;
+        control.finish(Ok(Reply::Snapshot(Arc::new(Snapshot {
+            profile: saved,
+            status: restarted,
+            nodes: Vec::new(),
+            devices: Vec::new(),
+        }))));
+        assert_eq!(control.profile.buses[0].gain_db, -15.0);
+        assert!(control.save_blocked());
     }
 
     #[test]

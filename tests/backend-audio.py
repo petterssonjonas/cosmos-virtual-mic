@@ -186,7 +186,7 @@ def profile(channels="mono"):
     return {
         "version": 1,
         "buses": [{"id": "voice", "name": "Voice", "channels": channels,
-                   "enabled": True, "hidden": False, "muted": False,
+                   "enabled": True, "hidden": False, "muted": False, "gain_db": 0.0,
                    "effects": [{"id": "gate", "enabled": True, "effect": {
                        "kind": "gate", "threshold_db": -20.0, "attack_ms": 5.0,
                        "release_ms": 20.0, "hold_ms": 0.0}}]}],
@@ -275,6 +275,44 @@ def assert_meter(h, amplitude, suppressed=False):
                 "Output meter does not reflect actual output")
 
 
+def verify_boosted_limiter(h):
+    output = "cosmos.bus.voice.output"
+    for channels, ceiling_db in ((1, -1.0), (2, -6.0)):
+        desired = profile("mono" if channels == 1 else "stereo")
+        bus = desired["buses"][0]
+        bus["effects"].append({"id": "limiter", "enabled": True, "effect": {
+            "kind": "limiter", "ceiling_db": ceiling_db, "release_ms": 5.0}})
+        h.apply(desired)
+        h.wait_bus()
+        h.audio(f"limiter-before-boost-{channels}", output, 0.95, channels=channels)
+        serials = {
+            name: h.nodes()[name]["info"]["props"]["object.serial"]
+            for name in ("cosmos.bus.voice.input", output)
+        }
+        bus["gain_db"] = 12.0
+        h.apply(desired)
+        measured = h.audio(f"boosted-limiter-{channels}", output, 0.95, channels=channels)
+        ceiling = 10 ** (ceiling_db / 20)
+        require(all(0.8 * ceiling < item["peak"] <= 1.03 * ceiling for item in measured),
+                f"+12 dB fader escaped final limiter ceiling {ceiling_db} dB: {measured}")
+        bus["muted"] = True
+        h.apply(desired)
+        muted = h.audio(f"boosted-limiter-muted-{channels}", output, 0.95, channels=channels)
+        require(all(item["peak"] == 0.0 for item in muted),
+                f"Boosted limiter leaked audio or release tails while muted: {muted}")
+        bus["muted"] = False
+        h.apply(desired)
+        unavailable = h.audio(f"boosted-limiter-unavailable-{channels}", output, 0.95,
+                              channels=channels, source_name="different-source")
+        require(all(item["peak"] == 0.0 for item in unavailable),
+                f"Boosted unavailable limiter leaked audio: {unavailable}")
+        require(all(h.nodes()[name]["info"]["props"]["object.serial"] == serial
+                    for name, serial in serials.items()),
+                "Live limiter gain or safety mute replaced an endpoint")
+    h.apply(profile())
+    h.wait_bus()
+
+
 def verify(h):
     output = "cosmos.bus.voice.output"
     h.start_engine()
@@ -302,6 +340,7 @@ def verify(h):
     assert_passes(h.audio("source-rate-44100", output, 0.4, source_rate=44100))
     verify_meter_continuity(h)
     verify_sibling_isolation(h)
+    verify_boosted_limiter(h)
     meter_name = "cosmos.bus.voice.meter-input"
     old_meter = h.nodes()[meter_name]
     old_serial = old_meter["info"]["props"]["object.serial"]
@@ -314,6 +353,8 @@ def verify(h):
                "source removal marks route unavailable", (h.engine,))
     assert_silent(h.audio("no-source-substitution", output, 0.4, source_name="different-source"))
     assert_passes(h.audio("selected-source-returned", output, 0.4))
+    require(h.last_status["discovery_error"] is None,
+            "Normal source negotiation left a persistent discovery error")
     assert_silent(h.audio("ambiguous-source", output, 0.4, duplicate=True))
     require(any(route["state"] == "error" for route in h.last_status["backend"]["routes"]),
             "Ambiguous source was not reported")
@@ -345,14 +386,39 @@ def verify(h):
     assert_passes(h.audio("live-threshold", output, 0.02))
     require(h.nodes()[output]["info"]["props"]["object.serial"] == node_serial,
             "Live parameter edit replaced recording endpoint")
+    endpoint_serials = {
+        name: h.nodes()[name]["info"]["props"]["object.serial"]
+        for name in ("cosmos.bus.voice.input", output)
+    }
+    for gain_db in (-12.0, -60.0, 12.0):
+        changed["buses"][0]["gain_db"] = gain_db
+        h.apply(changed)
+        measured = h.audio(f"live-bus-gain-{gain_db:g}", output, 0.02)
+        expected = 10 ** (gain_db / 20)
+        require(all(0.9 * expected < item["ratio"] < 1.1 * expected for item in measured),
+                f"Live bus gain {gain_db} dB did not scale actual audio: {measured}")
+        require(all(h.nodes()[name]["info"]["props"]["object.serial"] == serial
+                    for name, serial in endpoint_serials.items()),
+                "Live bus gain replaced an endpoint")
+    assert_silent(h.audio("boosted-unavailable-bus", output, 0.4, source_name="different-source"))
+    changed["buses"][0]["gain_db"] = 0.0
+    h.apply(changed)
     changed["buses"][0]["hidden"] = True
     h.apply(changed)
     assert_passes(h.audio("hidden-is-not-muted", output, 0.02))
     changed["buses"][0]["muted"] = True
+    changed["buses"][0]["gain_db"] = 12.0
     h.apply(changed)
     assert_silent(h.audio("bus-muted", output, 0.4))
     require(h.nodes()[output]["info"]["props"]["object.serial"] == node_serial,
             "Mute replaced recording endpoint")
+    changed["buses"][0]["gain_db"] = -60.0
+    h.apply(changed)
+    assert_silent(h.audio("muted-live-gain-change", output, 0.4))
+    require(all(h.nodes()[name]["info"]["props"]["object.serial"] == serial
+                for name, serial in endpoint_serials.items()),
+            "Muted gain edit replaced an endpoint")
+    changed["buses"][0]["gain_db"] = 0.0
     changed["buses"][0]["muted"] = False
     changed["routes"][0]["enabled"] = False
     h.apply(changed)
@@ -428,6 +494,20 @@ def verify(h):
     h.apply(stereo)
     h.wait_bus()
     assert_passes(h.audio("stereo-gate", output, 0.4, channels=2))
+    stereo_serials = {
+        name: h.nodes()[name]["info"]["props"]["object.serial"]
+        for name in ("cosmos.bus.voice.input", output)
+    }
+    stereo["buses"][0]["gain_db"] = -12.0
+    h.apply(stereo)
+    attenuated = h.audio("stereo-live-bus-gain", output, 0.4, channels=2)
+    expected = 10 ** (-12.0 / 20)
+    require(all(0.9 * expected < item["ratio"] < 1.1 * expected for item in attenuated),
+            "Live stereo bus gain did not attenuate both channels")
+    require(all(h.nodes()[name]["info"]["props"]["object.serial"] == serial
+                for name, serial in stereo_serials.items()),
+            "Live stereo gain replaced an endpoint")
+    stereo["buses"][0]["gain_db"] = 0.0
     stereo["buses"][0]["effects"] = copy.deepcopy(desired["buses"][0]["effects"])
     h.apply(stereo)
     h.wait_bus()

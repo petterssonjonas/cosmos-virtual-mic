@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MPL-2.0
 [workspace]
-members = ["crates/control", "crates/engine"]
+members = ["crates/control", "crates/engine", "crates/mixer"]
 resolver = "3"
 
 [workspace.package]

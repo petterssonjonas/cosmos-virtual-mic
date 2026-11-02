@@ -51,6 +51,8 @@ pub struct Bus {
     pub enabled: bool,
     pub hidden: bool,
     pub muted: bool,
+    #[serde(default)]
+    pub gain_db: f32,
     pub effects: Vec<EffectInstance>,
 }
 
@@ -310,6 +312,7 @@ impl Profile {
         for bus in &self.buses {
             identifier(&bus.id)?;
             text(&bus.name, "bus name", 128, false)?;
+            range(bus.gain_db, -60.0, 12.0, "bus gain_db")?;
             if !buses.insert(bus.id.as_str()) {
                 return Err(invalid("duplicate bus ID"));
             }
@@ -427,8 +430,46 @@ mod tests {
             enabled: true,
             hidden: false,
             muted: false,
+            gain_db: 0.0,
             effects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bus_gain_defaults_for_version_one_and_round_trips_valid_boundaries() {
+        let legacy = br#"{"version":1,"buses":[{"id":"voice","name":"Voice","channels":"mono","enabled":true,"hidden":false,"muted":false,"effects":[]}],"devices":[],"routes":[]}"#;
+        let mut profile = Profile::decode(legacy).unwrap();
+        assert_eq!(profile.buses[0].gain_db, 0.0);
+        for gain_db in [-60.0, -6.0, 0.0, 12.0] {
+            profile.buses[0].gain_db = gain_db;
+            profile.validate().unwrap();
+            let bytes = crate::encode(&profile, MAX_PROFILE_BYTES).unwrap();
+            assert_eq!(Profile::decode(&bytes).unwrap(), profile);
+        }
+    }
+
+    #[test]
+    fn bus_gain_rejects_nonfinite_and_out_of_range_values_even_when_muted() {
+        let mut profile = Profile {
+            buses: vec![bus("voice")],
+            ..Profile::default()
+        };
+        profile.buses[0].muted = true;
+        for gain_db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -60.01, 12.01] {
+            profile.buses[0].gain_db = gain_db;
+            assert!(profile.validate().is_err(), "accepted gain {gain_db}");
+        }
+        for gain_db in [-61, 13] {
+            let mut value = serde_json::to_value(Profile {
+                buses: vec![bus("voice")],
+                ..Profile::default()
+            })
+            .unwrap();
+            value["buses"][0]["gain_db"] = gain_db.into();
+            assert!(Profile::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        let overflow = br#"{"version":1,"buses":[{"id":"voice","name":"Voice","channels":"mono","enabled":true,"hidden":false,"muted":false,"gain_db":1e999,"effects":[]}],"devices":[],"routes":[]}"#;
+        assert!(Profile::decode(overflow).is_err());
     }
 
     #[test]

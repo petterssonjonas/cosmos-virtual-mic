@@ -2,11 +2,39 @@
 
 ## Resume here
 
-Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside the `cosmos` toolbox and source `dev-env.sh` before Rust commands. The main checkout is `/home/jp/Projects/cosmos-audio-mixer`. The backend implementation worktree is `/home/jp/Projects/.worktrees/cosmos-audio-mixer/backend-routing`, on `feature/backend-routing`. Start new work from `development`.
+Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside the `cosmos` toolbox and source `dev-env.sh` before Rust commands. The main checkout is `/home/jp/Projects/cosmos-audio-mixer`. Current frontend work is in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/native-mixer`, on `feature/native-mixer`, based on refreshed `origin/development`. The main checkout's pre-existing `.gitignore` change was left untouched.
 
-The Rust backend now hosts native LSP DSP, creates named playback/recording endpoints, reconciles explicit routes, provides real input/output levels, and persists validated profiles. It has passed private synthetic-audio and recovery checks. The libcosmic frontend is not implemented. Physical hardware, latency, clock drift, and long-running reliability remain separate validation work; do not claim release readiness.
+The Rust backend hosts native LSP DSP, named playback/recording endpoints, explicit routes, real input/output levels, and validated persistent profiles. The native libcosmic frontend is implemented. Physical hardware, latency, clock drift, desktop accessibility, and long-running reliability remain release validation work; do not claim release readiness.
 
-## Current implementation — 2026-11-01
+## Native frontend — 2026-11-02
+
+- Added `crates/mixer`, package/executable `cosmos-audio-mixer`, pinned to libcosmic `95236a944bfd51c63a2fc65fe50a592c47168d40`. The engine and control crates remain toolkit-independent.
+- Added mono/stereo channel strips with volume, gate/compressor threshold and enable controls, full dynamics popup, per-channel parametric EQ popup, real input/output meters, and independent mute/hide/enable controls.
+- Added a two-axis warmth/brightness color pad with labelled slider alternatives and ordinary EQ processing. No proprietary algorithm, recording controls, cassette UI, or other mixer's application code was used.
+- Added explicit routing and local device aliases/visibility/participation controls. Audio controls are live while used, including slider and color drags. There is no Apply button, default-device takeover, or automatic microphone selection.
+- The separate engine can be started/stopped explicitly. Closing/reopening the window leaves its saved audio state running. Final close/stop/reload actions wait for pending saves, and failures retain local edits. A fresh default launch lets the engine create its own private socket directory.
+- Worker I/O is bounded to one request with the latest desired profile as the pending state. Acknowledgements cannot overwrite newer input, and due meter polls run between writes. Rejected writes stop automatic retries. Unknown write outcomes are reconciled against the exact sent profile before writes resume.
+- Added persisted `Bus.gain_db`, default 0 dB for existing profiles. The fader precedes a trailing limiter; a separate terminal stage enforces mute/unavailable silence. The real audio harness checks boosted mono/stereo limiter ceilings, live gain, stable endpoints, and exact silence.
+- Corrected the stale discovery warning exposed by the native smoke. In the read-only discovery connection, `ENOENT` can mean that a format is not yet negotiated or an object has disappeared, including removal races reported on the core. It now requests reconciliation without setting a persistent error; permission and transport errors are preserved. Regression coverage checks both diagnostic classification and actual source negotiation.
+- Independent state/lifecycle and control/DSP reviews found no remaining blockers after corrections. The profile pre-check and Apply are not atomic across multiple clients; use one editing client at a time.
+- Native window rendering succeeded with a private headless Weston compositor after the existing session socket failed with `NoCompositor`. No host audio graph or defaults were changed.
+- Temporary pinned-iced widget simulation exercised real mouse events and the actual control worker/engine, not a web mockup. The live-control smoke deliberately omitted mouse-release events and observed successive gain changes in real synthetic output, a coalesced final gain, immediate mute, gate attenuation, EQ/color persistence, stable endpoints, and reopen. The earlier smoke also covered channel creation, popups, retained edits, reload, and fresh default engine launch. The simulator's text-input selector calls an unimplemented upstream method; the smoke used its public raw-text selector API. Temporary smoke code/dependencies are not part of the application.
+- AT-SPI tree and screen-reader behavior remain unverified. The available launcher exposes `IsEnabled`, but the pinned AccessKit listens for `ScreenReaderEnabled`. No fake service or source fork was introduced.
+
+Backend audio/lifecycle evidence is at `/var/tmp/cosmos-backend-_28bevqy`, including a Ready source with `discovery_error: null`. The live-control widget/audio smoke passed with evidence at `/var/tmp/cosmos-live-jxat2fse`. Earlier native Weston rendering evidence is at `/var/tmp/cosmos-ui-ontunmpb`. These are local temporary evidence paths, not repository assets. `DEVELOPMENT.md` records final checks and remaining verification limits.
+
+Launch from the feature worktree after sourcing `dev-env.sh`:
+
+```sh
+cargo build --workspace --locked
+./target/debug/cosmos-audio-mixer
+```
+
+The repository now has `origin`. SSH authentication was unavailable in this session; HTTPS with the installed `gh` credential helper worked without global credential changes. The user authorized a reviewed PR and squash merge to `development` after validation, not a merge to `main` or a published Release. Consult the PR and its checks for hosted state.
+
+The workstation target is Fedora 44 Workstation, x86-64, glibc 2.43. Prefer copying both optimized test executables together and installing native runtime dependencies; see `DEVELOPMENT.md`. This is private development testing, not distribution packaging. Do not replace workstation glibc or change host audio defaults.
+
+## Backend milestone — 2026-11-01 (historical)
 
 - Verified all 24 native packages inside `cosmos`, Rust/Cargo 1.99.1, native PipeWire 1.6.11, LSP LV2 1.2.29 discovery, and filter-host runtime linkage.
 - Preserved the owner's governance changes in bootstrap commit `7c88940`. With current-task authorization, squash-merged the reviewed discovery milestone into local `development` as `8c07f7c`, then created the backend worktree. No remote exists; no push, PR, or hosted CI was possible.
@@ -23,7 +51,7 @@ The Rust backend now hosts native LSP DSP, creates named playback/recording endp
 - Independent persistence, realtime-meter, and native-routing reviews found no remaining blockers after fixes. The standalone private DSP harness remains useful for plugin/host diagnostics; the backend harness tests the actual Rust application.
 - No live microphone capture, host service changes, default changes, or unrelated routing changes occurred. No rejected mixer source was used.
 
-Next product work: build the libcosmic frontend against the working backend contract. Keep the original reliability matrix as the release requirement. Physical hotplug/Bluetooth, independent-clock hardware, latency, long soak tests, and actual GUI responsiveness still need evidence and, where disruptive, explicit owner permission.
+Next release work: complete the original reliability matrix, especially physical hotplug/Bluetooth, independent-clock hardware, latency, soak checks, desktop keyboard/window-manager behavior, and accessibility. Disruptive hardware checks still require explicit owner permission. The native frontend is no longer an unimplemented milestone.
 
 `DEVELOPMENT.md` contains commands, profile semantics, lifecycle invariants, and verification boundaries. A complete dependency licence/source/notice audit remains required before distribution.
 

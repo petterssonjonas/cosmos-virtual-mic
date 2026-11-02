@@ -193,9 +193,15 @@ impl Observed {
     }
 
     fn core_error(&mut self, id: u32, result: i32, message: &str) {
+        if result == -libc::ENOENT {
+            // This read-only connection can query a format before negotiation
+            // or an object after removal. The latter can be reported on the core.
+            // Reconcile without turning missing resources into a persistent error.
+            self.graph_revision = self.graph_revision.wrapping_add(1);
+            return;
+        }
         let message: String = message.chars().take(512).collect();
-        // Native filter-chain treats only core EPIPE as connection loss. A core
-        // ENOENT can be a raced resource destroy while the transport stays alive.
+        // Native filter-chain treats only core EPIPE as connection loss.
         if id == pw::core::PW_ID_CORE && result == -libc::EPIPE {
             self.connection_error =
                 Some(format!("PipeWire connection failed ({result}): {message}"));
@@ -760,6 +766,7 @@ mod tests {
                 enabled: true,
                 hidden: false,
                 muted: false,
+                gain_db: 0.0,
                 effects: vec![],
             }],
             routes: vec![
@@ -790,6 +797,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_object_parameters_do_not_poison_discovery_or_clear_real_errors() {
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        state.core_error(7, -libc::ENOENT, "format not negotiated");
+        assert!(state.status.discovery_error.is_none());
+        assert!(state.connection_error.is_none());
+        assert_eq!(state.status.phase, Phase::Connected);
+
+        state.core_error(7, -libc::EACCES, "access denied");
+        let error = state.status.discovery_error.clone().unwrap();
+        state.core_error(8, -libc::ENOENT, "resource removed");
+        assert_eq!(
+            state.status.discovery_error.as_deref(),
+            Some(error.as_str())
+        );
+        assert!(state.connection_error.is_none());
+    }
+
+    #[test]
     fn raced_resource_errors_preserve_the_live_generation_and_request_reconcile() {
         let mut state = Observed::new();
         state.status.phase = Phase::Connected;
@@ -806,23 +832,10 @@ mod tests {
         assert_eq!(state.status.generation, 8);
         assert_eq!(state.snapshot().len(), 1);
         assert_ne!(state.graph_revision, revision);
-        assert!(
-            state
-                .status
-                .discovery_error
-                .as_ref()
-                .unwrap()
-                .contains("raced resource removal")
-        );
+        assert!(state.status.discovery_error.is_none());
         state.core_error(7, -libc::EPIPE, "individual resource failed");
         assert!(state.connection_error.is_none());
         state.core_error(pw::core::PW_ID_CORE, -libc::EPIPE, "transport closed");
-        assert!(
-            state
-                .connection_error
-                .as_ref()
-                .unwrap()
-                .contains("transport closed")
-        );
+        assert!(state.connection_error.is_some());
     }
 }

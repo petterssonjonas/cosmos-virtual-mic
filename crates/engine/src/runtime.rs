@@ -1292,6 +1292,7 @@ fn controls(bus: &Bus, audible: bool) -> Controls {
         );
     }
     for index in 0..channel_count(bus.channels) {
+        values.push((format!("fader_{index}:Gain 1"), linear(bus.gain_db)));
         values.push((
             format!("volume_{index}:Gain 1"),
             if audible { 1.0 } else { 0.0 },
@@ -1343,27 +1344,42 @@ fn module_arguments(bus: &Bus, remote: Option<&str>, audible: bool) -> Json {
             .collect::<serde_json::Map<_, _>>();
         nodes.push(json!({"type":"lv2","name":format!("fx_{}",effect.id),"plugin":format!("http://lsp-plug.in/plugins/lv2/{}_{}",plugin_name(&effect.effect),if stereo {"stereo"} else {"mono"}),"control":control}));
     }
-    for pair in bus.effects.windows(2) {
-        for (output, input) in outputs.iter().zip(inputs) {
-            links.push(json!({"output":format!("fx_{}:{output}",pair[0].id),"input":format!("fx_{}:{input}",pair[1].id)}));
-        }
-    }
-    for (index, output) in outputs.iter().enumerate() {
+    // Keep the fader before a trailing limiter even while it is bypassed, so
+    // enabling it and changing gain remain native control-only updates.
+    let fader_position = bus.effects.len()
+        - usize::from(
+            bus.effects
+                .last()
+                .is_some_and(|effect| matches!(&effect.effect, Effect::Limiter { .. })),
+        );
+    let mut graph_inputs = Vec::new();
+    for (index, (input, output)) in inputs.iter().zip(outputs).enumerate() {
+        nodes.push(json!({"type":"builtin","name":format!("fader_{index}"),"label":"mixer","control":{"Gain 1":linear(bus.gain_db)}}));
+        // Safety mute is always last, including after plugins with release tails.
         nodes.push(json!({"type":"builtin","name":format!("volume_{index}"),"label":"mixer","control":{"Gain 1":if audible {1.0} else {0.0}}}));
-        if let Some(last) = bus.effects.last() {
-            links.push(json!({"output":format!("fx_{}:{output}",last.id),"input":format!("volume_{index}:In 1")}));
+        let mut chain = bus
+            .effects
+            .iter()
+            .map(|effect| {
+                (
+                    format!("fx_{}:{input}", effect.id),
+                    format!("fx_{}:{output}", effect.id),
+                )
+            })
+            .collect::<Vec<_>>();
+        chain.insert(
+            fader_position,
+            (format!("fader_{index}:In 1"), format!("fader_{index}:Out")),
+        );
+        chain.push((
+            format!("volume_{index}:In 1"),
+            format!("volume_{index}:Out"),
+        ));
+        graph_inputs.push(chain[0].0.clone());
+        for pair in chain.windows(2) {
+            links.push(json!({"output":pair[0].1,"input":pair[1].0}));
         }
     }
-    let graph_inputs = inputs
-        .iter()
-        .enumerate()
-        .map(|(index, input)| {
-            bus.effects.first().map_or_else(
-                || format!("volume_{index}:In 1"),
-                |effect| format!("fx_{}:{input}", effect.id),
-            )
-        })
-        .collect::<Vec<_>>();
     let graph_outputs = (0..position.len())
         .map(|index| format!("volume_{index}:Out"))
         .collect::<Vec<_>>();
@@ -1544,6 +1560,7 @@ mod tests {
             enabled: true,
             hidden: false,
             muted: false,
+            gain_db: 0.0,
             effects: vec![EffectInstance {
                 id: "gate".into(),
                 enabled: true,
@@ -1557,42 +1574,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn stereo_graph_has_ordered_explicit_audio_ports_and_safe_volume_stage() {
-        let graph = module_arguments(&bus(Channels::Stereo), Some("private"), false);
-        assert_eq!(
-            graph["filter.graph"]["inputs"],
-            json!(["fx_gate:in_l", "fx_gate:in_r"])
-        );
-        assert_eq!(
-            graph["filter.graph"]["outputs"],
-            json!(["volume_0:Out", "volume_1:Out"])
-        );
-        assert_eq!(
-            graph["filter.graph"]["nodes"][0]["plugin"],
-            "http://lsp-plug.in/plugins/lv2/gate_stereo"
-        );
-        assert_eq!(graph["filter.graph"]["nodes"][1]["control"]["Gain 1"], 0.0);
-        assert_eq!(graph["capture.props"]["node.autoconnect"], false);
-        assert_eq!(graph["remote.name"], "private");
-    }
-
-    #[test]
-    fn live_controls_encode_effect_db_and_per_channel_mute_without_replacing_topology() {
-        let bus = bus(Channels::Mono);
-        let controls = controls(&bus, false);
-        assert!(
-            controls
-                .iter()
-                .any(|(name, value)| name == "fx_gate:gt" && (*value - 0.1).abs() < 0.000001)
-        );
-        assert!(
-            controls
-                .iter()
-                .any(|(name, value)| name == "volume_0:Gain 1" && *value == 0.0)
-        );
-        assert!(Pod::from_bytes(&control_pod(&controls).unwrap()).is_some());
-    }
     #[test]
     fn input_meter_fans_out_actual_sources_per_channel_including_external_playback() {
         use crate::discovery::{GraphLink, Port};

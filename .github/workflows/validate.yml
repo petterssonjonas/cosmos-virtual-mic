@@ -43,4 +43,5 @@ jobs:
             "$CARGO_HOME/bin/rustup" run "$toolchain" cargo build --workspace --locked
             "$CARGO_HOME/bin/rustup" run "$toolchain" cargo test --workspace --locked
             "$CARGO_HOME/bin/rustup" run "$toolchain" cargo clippy --workspace --all-targets --locked -- -D warnings
+            python3 tests/session-policy.py
           '

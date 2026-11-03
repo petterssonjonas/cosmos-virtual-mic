@@ -348,14 +348,14 @@ impl HostedBus {
 fn touches_retired(
     pairs: &[(u32, u32)],
     observed: &Observed,
-    retired: &std::collections::BTreeSet<u32>,
+    retired: &BTreeMap<u32, String>,
 ) -> bool {
     pairs.iter().any(|(output, input)| {
         [output, input].iter().any(|id| {
             observed
                 .ports
                 .get(id)
-                .is_some_and(|port| retired.contains(&port.node_id))
+                .is_some_and(|port| retired.contains_key(&port.node_id))
         })
     })
 }
@@ -364,9 +364,10 @@ pub struct Runtime {
     routes: BTreeMap<String, OwnedRoute>,
     buses: BTreeMap<String, HostedBus>,
     route_retries: BTreeMap<String, Instant>,
-    retired_nodes: std::collections::BTreeSet<u32>,
+    retired_nodes: BTreeMap<u32, String>,
     remote: Option<String>,
     generation: u64,
+    policy_revision: u64,
     profile: Option<Profile>,
     revision: u64,
     refresh_at: Option<Instant>,
@@ -380,9 +381,10 @@ impl Runtime {
             routes: BTreeMap::new(),
             buses: BTreeMap::new(),
             route_retries: BTreeMap::new(),
-            retired_nodes: std::collections::BTreeSet::new(),
+            retired_nodes: BTreeMap::new(),
             remote: remote.map(str::to_owned),
             generation: 0,
+            policy_revision: 0,
             profile: None,
             revision: 0,
             refresh_at: None,
@@ -408,9 +410,21 @@ impl Runtime {
     ) -> BackendStatus {
         if observed.status.generation != self.generation
             || observed.status.phase != Phase::Connected
+            || observed.policy_revision != self.policy_revision
         {
+            let same_generation = observed.status.generation == self.generation;
             self.shutdown();
+            if same_generation && observed.status.phase == Phase::Connected {
+                self.retired_nodes.extend(
+                    observed
+                        .owned_node_serials()
+                        .map(|(id, serial)| (id, serial.to_owned())),
+                );
+            }
             self.generation = observed.status.generation;
+            // A new policy owner must configure new, idle endpoints. Reusing
+            // running adapters can leave its activation queue waiting forever.
+            self.policy_revision = observed.policy_revision;
         }
         let Some(connection) = connection.filter(|_| observed.status.phase == Phase::Connected)
         else {
@@ -473,7 +487,7 @@ impl Runtime {
         self.refresh_at = None;
         let mut nodes = observed.snapshot();
         self.retired_nodes
-            .retain(|id| nodes.iter().any(|node| node.id == *id));
+            .retain(|id, serial| observed.node_serial(*id) == Some(serial.as_str()));
         let retiring = if changed {
             self.buses
                 .iter()
@@ -494,8 +508,9 @@ impl Runtime {
                 if ["input", "output", "meter-input", "meter-output"]
                     .iter()
                     .any(|suffix| node.name == format!("cosmos.bus.{id}.{suffix}"))
+                    && let Some(serial) = observed.node_serial(node.id)
                 {
-                    self.retired_nodes.insert(node.id);
+                    self.retired_nodes.insert(node.id, serial.to_owned());
                 }
             }
         }
@@ -519,7 +534,7 @@ impl Runtime {
                 self.buses.remove(&id);
             }
         }
-        nodes.retain(|node| !self.retired_nodes.contains(&node.id));
+        nodes.retain(|node| !self.retired_nodes.contains_key(&node.id));
         self.routes.retain(|id, _| {
             profile
                 .routes
@@ -564,7 +579,12 @@ impl Runtime {
                         .any(|route| route.enabled && is_bus(&route.to, &bus.id));
                 match NativeModule::load(
                     connection.context(),
-                    &module_arguments(bus, self.remote.as_deref(), audible),
+                    &module_arguments(
+                        bus,
+                        self.remote.as_deref(),
+                        audible,
+                        observed.policy_id.is_some(),
+                    ),
                     &self.dirty,
                 ) {
                     Ok(module) => {
@@ -1326,7 +1346,7 @@ fn channel_count(channels: Channels) -> u32 {
     }
 }
 
-fn module_arguments(bus: &Bus, remote: Option<&str>, audible: bool) -> Json {
+fn module_arguments(bus: &Bus, remote: Option<&str>, audible: bool, policy_managed: bool) -> Json {
     let stereo = bus.channels == Channels::Stereo;
     let inputs: &[&str] = if stereo { &["in_l", "in_r"] } else { &["in"] };
     let outputs: &[&str] = if stereo {
@@ -1383,16 +1403,21 @@ fn module_arguments(bus: &Bus, remote: Option<&str>, audible: bool) -> Json {
     let graph_outputs = (0..position.len())
         .map(|index| format!("volume_{index}:Out"))
         .collect::<Vec<_>>();
+    // Desktop policy owns public port configuration. Private graphs without a
+    // session manager still need native auto-configuration.
     let endpoint = |output: bool| {
-        json!({
+        let mut properties = json!({
             "node.name":bus_name(bus,output), "node.description":bus.name,
             "media.class":if output {"Audio/Source"} else {"Audio/Sink"},
             "cosmos.owner":OWNER, "cosmos.bus.id":bus.id,
             "node.autoconnect":false, "node.dont-reconnect":true,
             "node.always-process":true,"node.pause-on-idle":false,
             "audio.channels":channel_count(bus.channels),"audio.position":position,
-            "adapter.auto-port-config":{"mode":"dsp","monitor":false},
-        })
+        });
+        if !policy_managed {
+            properties["adapter.auto-port-config"] = json!({"mode":"dsp","monitor":false});
+        }
+        properties
     };
     let mut result = json!({
         "node.description":bus.name,"audio.rate":48000,
@@ -1698,7 +1723,7 @@ mod tests {
                 },
             );
         }
-        let retired = std::collections::BTreeSet::from([2]);
+        let retired = BTreeMap::from([(2, "retired-node-serial".into())]);
         assert!(touches_retired(&[(10, 20)], &observed, &retired));
         assert!(touches_retired(&[(20, 30)], &observed, &retired));
         assert!(!touches_retired(&[(10, 30)], &observed, &retired));

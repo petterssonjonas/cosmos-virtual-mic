@@ -158,6 +158,8 @@ Lifecycle invariants:
 - IPC accepts at most eight active clients, 68 KiB requests, and 2 MiB responses. Complete serialized profiles are limited to 64 KiB. Server requests have a 1 s deadline; client operations have a 2 s absolute deadline. Stop has a bounded acknowledgement period.
 - Discovery reports identity candidates and channel semantics. Routing uses explicit selectors, never defaults or saved numeric IDs. Missing or ambiguous sources and unsupported layouts produce an error/unavailable state, not another microphone or a downmix.
 - Node `Format` and `EnumFormat` subscriptions follow the `SPA_PARAM_INFO_READ` flag. Subscription also starts enumeration, so an unreadable parameter must not be subscribed. When read access is removed, discovery clears the cached layout and ignores late parameter replies. Real I/O and permission errors remain visible.
+- The owner of a client-created `default` metadata object selects public endpoint configuration. When it is present, the engine publishes unconfigured adapters and waits for the session manager to publish their ports. Without it, the engine configures its private ports. Daemon-owned metadata alone does not indicate a session manager. An owner change recreates engine-owned buses and links; saved selectors and settings do not change. This can interrupt mixer audio, but must not block system device selection.
+- Internal meters use the `Cosmos/AudioMeter` class, not desktop recording-stream classes. The engine configures and links these ports. Discovery checks the bound node's owner and native stream ID before linking a meter.
 
 The locked dependency graph now includes libcosmic and its transitive Git dependencies, in addition to registry packages and the three local crates. The earlier 65-package backend-only inventory no longer describes this workspace. A complete licence/source/notice audit remains required before distribution.
 
@@ -168,7 +170,7 @@ The locked dependency graph now includes libcosmic and its transitive Git depend
 The version-1 profile contains `buses`, `devices`, and `routes`. See `crates/control/src/model.rs` for the strict schema and bounds, and `tests/backend-audio.py` for runnable synthetic examples.
 
 - Each bus has an independent ID/name, explicit `mono` or `stereo` channels, enable/hidden/mute flags, `gain_db`, and an ordered list of effect instances. Gain accepts finite values from -60 to +12 dB. Existing version-1 profiles without this field load at 0 dB.
-- Each bus publishes `cosmos.bus.<id>.input` as a playback sink and `cosmos.bus.<id>.output` as a recording source. No system defaults change. Applications can use the input directly, or receive explicit engine-owned routes.
+- Each bus publishes `cosmos.bus.<id>.input` as a playback sink and `cosmos.bus.<id>.output` as a recording source. The engine does not write system-default preferences. The session manager can select a newly available endpoint under its own saved policy, especially when the configured hardware is absent. Applications can use the input directly, or receive explicit engine-owned routes.
 - Supported effects are gate, compressor, one parametric EQ band per instance, and limiter. Multiple EQ instances form a multi-band chain. Gate controls include threshold, attack, hold, and release. Parameters use explicit dB, Hz, and milliseconds and must fit the installed native plugin ranges.
 - Parameter changes, volume, and mute use native live controls and retain endpoint identity. The volume stage is before a trailing limiter, or after the other effects when no trailing limiter exists. A separate final safety stage enforces exact silence for mute/unavailability. Disabling or removing the limiter removes its ceiling protection. Effect topology/channel changes safely replace the affected bus and can interrupt its clients. Endpoint logical names remain stable.
 - Device selectors use the identity properties from discovery. The saved profile's device aliases, visibility, enable state, and mute stay local to this mixer. Hiding does not mute or disable. These local settings do not change hardware names, profiles, volume, or availability outside the mixer. Separate, explicit system-profile actions are described below.
@@ -203,6 +205,18 @@ Verified paths include:
 - Missing native plugins with no bypass endpoints, plugin restoration, and corrupt-profile preservation/recovery.
 
 Physical microphone hotplug, Bluetooth transitions, independent hardware clocks, end-to-end latency, and long-running resource growth still require separate authorized validation. The private tests do not capture a live microphone or change desktop audio.
+
+### Session policy and native upgrades
+
+Run `python3 tests/session-policy.py --keep` after a PipeWire or WirePlumber update. The development validation workflow also runs this check against its resolved native RPMs. Use `--engine PATH` to compare another engine binary.
+
+The check starts a private PipeWire server and a private WirePlumber **policy-only** instance. Hardware monitors and D-Bus components are disabled. HOME, runtime, state, configuration, and audio sockets are isolated. It uses only synthetic audio. It checks daemon-owned metadata without a session manager, mono and stereo, both startup orders, default-output changes followed by a separate playback application, normal recording from the virtual source, direct application playback into the virtual sink, live meters during recording, and a session-manager restart.
+
+The Fedora 45 investigation on 2026-11-03 found a port-configuration race with PipeWire 1.6.11 and WirePlumber 0.5.19. The old engine configured and linked ports before desktop policy finished configuring the same nodes. PipeWire rejected `Format`/`PortConfig` with `-EIO` because the node had started. WirePlumber then waited for port setup, which blocked later device-selection events until the engine stopped. A live diagnostic identified an internal output meter; private stereo tests also exposed the public-endpoint path.
+
+The fix gives each port one configuration owner. It does not use a boot delay, package-version check, system-wide policy override, or private WirePlumber item flag. The private-policy regression is required evidence for future native updates; it cannot guarantee compatibility with untested releases.
+
+Known limit: changing WirePlumber's global `node.features.audio.*` settings while mixer audio is running can request another in-place adapter configuration. That path is not covered by this startup/restart fix. Stop the mixer before changing those global settings.
 
 ### System device profiles
 
@@ -266,7 +280,7 @@ Desktop indicator rendering, launcher focus, physical devices, Bluetooth, indepe
 
 The supplied architectures are **x86-64/amd64** and **aarch64/ARM64**. These are 64-bit Linux binaries, not 32-bit x86 or the x32 ABI. They require glibc, Wayland, PipeWire with its native LV2 host, LSP LV2 plugins, and a systemd user manager for managed mode. `--standalone` remains available without service integration.
 
-The server update installed glibc 2.44. Do not copy a normal Fedora 45 build and assume it works on the Fedora 44 workstation's glibc 2.43. The test binaries were instead linked against verified Ubuntu 24.04 sysroots with the pinned Rust toolchain. Both GUI architectures require symbols through **GLIBC_2.39**; both engines require symbols through **GLIBC_2.34**. The bundle declares a common glibc floor of 2.39. Never replace the workstation's glibc with server libraries.
+The workstation was upgraded to Fedora 45 with glibc 2.44. Earlier portable bundles also targeted Fedora 44's glibc 2.43, so their test binaries were linked against verified Ubuntu 24.04 sysroots with the pinned Rust toolchain. Both portable GUI architectures require symbols through **GLIBC_2.39**; both engines require symbols through **GLIBC_2.34**. The bundle declares a common glibc floor of 2.39. A normal local Fedora 45 build is not a substitute for that portable build. Never replace workstation glibc with server libraries.
 
 **Stock Ubuntu support starts at 26.04**, not 24.04. Noble disables PipeWire LV2 support; installing only LSP cannot fix that. Resolute supplies the host in `libspa-0.2-modules-extra`. This was checked against signed package indexes and actual native processing, not version numbers alone. See the [Noble build rules](https://git.launchpad.net/ubuntu/+source/pipewire/plain/debian/rules?h=applied/ubuntu/noble-updates) and [Resolute build rules](https://git.launchpad.net/ubuntu/+source/pipewire/plain/debian/rules?h=applied/ubuntu/resolute).
 

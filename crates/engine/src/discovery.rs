@@ -132,6 +132,8 @@ pub struct Observed {
     pub ports: BTreeMap<u32, Port>,
     pub links: BTreeMap<u32, GraphLink>,
     pub graph_revision: u64,
+    pub policy_id: Option<u32>,
+    pub policy_revision: u64,
     pub connection_error: Option<String>,
 }
 
@@ -158,6 +160,8 @@ impl Observed {
             ports: BTreeMap::new(),
             links: BTreeMap::new(),
             graph_revision: 0,
+            policy_id: None,
+            policy_revision: 0,
             connection_error: None,
         }
     }
@@ -168,6 +172,8 @@ impl Observed {
         self.devices.clear();
         self.ports.clear();
         self.links.clear();
+        self.policy_id = None;
+        self.policy_revision = self.policy_revision.wrapping_add(1);
         self.graph_revision = self.graph_revision.wrapping_add(1);
         self.connection_error = None;
         self.status.discovery_error = None;
@@ -230,8 +236,31 @@ impl Observed {
         })
     }
 
+    pub fn node_serial(&self, id: u32) -> Option<&str> {
+        self.nodes
+            .get(&id)?
+            .properties
+            .get("object.serial")
+            .map(String::as_str)
+    }
+
+    pub fn owned_node_serials(&self) -> impl Iterator<Item = (u32, &str)> {
+        self.nodes
+            .iter()
+            .filter(|(_, record)| {
+                record.properties.get("cosmos.owner").map(String::as_str)
+                    == Some("cosmos-audio-mixer")
+            })
+            .filter_map(|(&id, record)| {
+                record
+                    .properties
+                    .get("object.serial")
+                    .map(|serial| (id, serial.as_str()))
+            })
+    }
+
     fn core_error(&mut self, id: u32, result: i32, message: &str) {
-        if result == -libc::ENOENT {
+        if result == -libc::ENOENT || result == -libc::ESTALE {
             // A request can race object removal, which can be reported on the core.
             // Reconcile without turning missing resources into a persistent error.
             self.graph_revision = self.graph_revision.wrapping_add(1);
@@ -461,6 +490,7 @@ impl Connection {
                             && !class.starts_with("Audio/Sink")
                             && class != "Stream/Output/Audio"
                             && class != "Stream/Input/Audio"
+                            && class != crate::meter::MEDIA_CLASS
                         {
                             return;
                         }
@@ -793,6 +823,18 @@ impl Connection {
                             },
                         }
                     }
+                    ObjectType::Metadata => {
+                        if global.props.is_some_and(|props| {
+                            props.get("metadata.name") == Some("default")
+                                && props.get("client.id").is_some()
+                        }) {
+                            let mut state = state.borrow_mut();
+                            state.policy_id = Some(id);
+                            state.policy_revision = state.policy_revision.wrapping_add(1);
+                            state.graph_revision = state.graph_revision.wrapping_add(1);
+                        }
+                        return;
+                    }
                     _ => return,
                 };
                 bindings.borrow_mut().insert(id, binding);
@@ -804,6 +846,10 @@ impl Connection {
                 if let Some(state) = remove_state.upgrade() {
                     let mut state = state.borrow_mut();
                     if state.status.generation == generation {
+                        if state.policy_id == Some(id) {
+                            state.policy_id = None;
+                            state.policy_revision = state.policy_revision.wrapping_add(1);
+                        }
                         state.nodes.remove(&id);
                         state.device_removed(id);
                         state.devices.remove(&id);

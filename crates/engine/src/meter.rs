@@ -15,6 +15,9 @@ use pw::spa::param::format::{MediaSubtype, MediaType};
 use pw::spa::param::{ParamType, format_utils};
 use pw::spa::pod::{Object, Pod, Value, serialize::PodSerializer};
 
+// Internal, manually linked nodes must not enter desktop stream/device policy.
+pub const MEDIA_CLASS: &str = "Cosmos/AudioMeter";
+
 const FRESH_MS: u64 = 500;
 const WAITING: u32 = 1;
 const BAD_FORMAT: u32 = 2;
@@ -224,7 +227,7 @@ impl Meter {
                 "node.description" => "Cosmos bus sample meter",
                 "media.type" => "Audio",
                 "media.category" => "Capture",
-                "media.class" => "Stream/Input/Audio",
+                "media.class" => MEDIA_CLASS,
                 "node.passive" => "true",
                 "node.autoconnect" => "false",
                 "node.dont-reconnect" => "true",

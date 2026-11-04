@@ -33,6 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y podman podman-toolbox
           toolbox create --assumeyes --container cosmos --image registry.fedoraproject.org/fedora-toolbox@sha256:bb687ae7bbfc8b957b1ac04bb0fd92f8e443c657220e863cfdf76a692342d663
+          toolbox run --container cosmos sudo dnf install -y python3 git
       - name: Gate the exact published Release inside cosmos
         id: gate
         run: |
@@ -92,6 +93,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y podman podman-toolbox
           toolbox create --assumeyes --container cosmos --image registry.fedoraproject.org/fedora-toolbox@sha256:bb687ae7bbfc8b957b1ac04bb0fd92f8e443c657220e863cfdf76a692342d663
+          toolbox run --container cosmos sudo dnf install -y python3 git
       - name: Preflight existing assets and upload missing assets without replacement
         env:
           GH_TOKEN: ${{ github.token }}

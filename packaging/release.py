@@ -25,7 +25,7 @@ DEB_LIBRARIES = {
     "libc.so.6": "libc6 (>= 2.44)", "libm.so.6": "libc6 (>= 2.44)",
     "libdl.so.2": "libc6 (>= 2.44)", "librt.so.1": "libc6 (>= 2.44)",
     "libpthread.so.0": "libc6 (>= 2.44)", "ld-linux-x86-64.so.2": "libc6 (>= 2.44)",
-    "libgcc_s.so.1": "libgcc-s1 (>= 16)", "libstdc++.so.6": "libstdc++6 (>= 16)",
+    "libgcc_s.so.1": "libgcc-s1", "libstdc++.so.6": "libstdc++6",
     "libfontconfig.so.1": "libfontconfig1", "libfreetype.so.6": "libfreetype6",
     "libexpat.so.1": "libexpat1", "libxkbcommon.so.0": "libxkbcommon0",
     "libwayland-client.so.0": "libwayland-client0", "libwayland-cursor.so.0": "libwayland-cursor0",
@@ -40,7 +40,6 @@ RUNTIME = """Cosmos Virtual Mic runtime requirements
 Architecture: x86_64 / amd64; Linux; glibc >= 2.44 (Fedora 45 build baseline).
 DEB: Ubuntu 26.10+ or a Debian system providing glibc >= 2.44 and the declared
 package dependencies. Stock Ubuntu 24.04 and 26.04 are NOT supported.
-Packages may additionally require GCC 16 runtime libraries when linked by Fedora 45.
 A working Wayland desktop, system graphics/font libraries, PipeWire >= 1.0,
 WirePlumber, PipeWire's native filter-chain/LV2 host, Lilv, and LSP LV2 plugins
 must be installed by the operating system. No desktop/audio stack is bundled.
@@ -173,8 +172,10 @@ def stage_system(bundle, stage):
         shutil.copytree(stage, verify_root, dirs_exist_ok=True)
         shutil.copytree("/usr/lib/systemd/system", verify_root / "usr/lib/systemd/system",
                         dirs_exist_ok=True, symlinks=True)
+        # --root is system-mode only; select the staged user-unit directory.
+        environment = dict(os.environ, SYSTEMD_UNIT_PATH="/usr/lib/systemd/user:/usr/lib/systemd/system")
         run("systemd-analyze", f"--root={verify_root}", "--man=no", "--generators=no",
-            "--recursive-errors=no", "verify", f"/usr/lib/systemd/user/{APP}.service")
+            "--recursive-errors=no", "verify", f"{APP}.service", env=environment)
 
 
 def smoke_tree(stage, expected):

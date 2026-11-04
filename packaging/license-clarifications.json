@@ -80,22 +80,6 @@
       ],
       "manifest_sha256": "54f471a97dda129f825d84c381533e099c799725ea181a706e043fce0b8359de"
     },
-    "lyon@1.0.19": {
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "texts": [
-        {
-          "path": "license-texts/216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
-          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
-          "source_url": "https://github.com/nical/lyon/blob/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-APACHE"
-        },
-        {
-          "path": "license-texts/80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
-          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
-          "source_url": "https://github.com/nical/lyon/blob/56219c95c658d4f39de7b190d98e57d5773ba241/LICENSE-MIT"
-        }
-      ],
-      "manifest_sha256": "d0247358d21759f525010d1732021c966e3937d17723896c6d40291aaccf2b4a"
-    },
     "lyon_path@1.0.19": {
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "texts": [
@@ -112,22 +96,6 @@
       ],
       "manifest_sha256": "f37569f37541593a26986d3fa5fa6d62a0a2ceb9793607bd88ec0a909bbc17ec"
     },
-    "lyon_algorithms@1.0.22": {
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "texts": [
-        {
-          "path": "license-texts/216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
-          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
-          "source_url": "https://github.com/nical/lyon/blob/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
-        },
-        {
-          "path": "license-texts/80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
-          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
-          "source_url": "https://github.com/nical/lyon/blob/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
-        }
-      ],
-      "manifest_sha256": "a3ee89366065fbd929e155f98420210f3ef8abb4e8c690a21c0718afc7c6b3c0"
-    },
     "lyon_geom@1.0.20": {
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "texts": [
@@ -143,22 +111,6 @@
         }
       ],
       "manifest_sha256": "c4ad1fab0b0e6a64cad01ee392a2ca41bf1bc89e6895ef12b79d8452ed9f2522"
-    },
-    "lyon_tessellation@1.0.23": {
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "texts": [
-        {
-          "path": "license-texts/216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06.txt",
-          "sha256": "216486f29671a4262efe32af6d84a75bef398127f8c5f369b5c8305983887a06",
-          "source_url": "https://github.com/nical/lyon/blob/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-APACHE"
-        },
-        {
-          "path": "license-texts/80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e.txt",
-          "sha256": "80f275e90d799911ed3830a7f242a2ef5a4ade2092fe0aa07bfb2d2cf2f2b95e",
-          "source_url": "https://github.com/nical/lyon/blob/db98d26a1a90076a7a894262dcb51117eef643c8/LICENSE-MIT"
-        }
-      ],
-      "manifest_sha256": "75816d66278bc4dd7823327b29a6177fdfa45e6cb17346da0b88ae24d032bf0f"
     },
     "profiling@1.0.18": {
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -320,32 +272,6 @@
         "lock_source": "git+https://github.com/pop-os/libcosmic#95236a944bfd51c63a2fc65fe50a592c47168d40"
       }
     ],
-    "cosmic-launch@0.1.0": {
-      "source": "git+https://github.com/pop-os/libcosmic?rev=95236a944bfd51c63a2fc65fe50a592c47168d40#95236a944bfd51c63a2fc65fe50a592c47168d40",
-      "manifest_sha256": "887de4105b70ab9e5b31cc31ab63b9e3d467bc9b722deda4156647ae69f26333",
-      "license": "MPL-2.0",
-      "texts": [
-        {
-          "path": "license-texts/1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5.txt",
-          "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
-          "source_url": "https://github.com/pop-os/libcosmic/blob/95236a944bfd51c63a2fc65fe50a592c47168d40/LICENSE"
-        }
-      ],
-      "lock_source": "git+https://github.com/pop-os/libcosmic?rev=95236a944bfd51c63a2fc65fe50a592c47168d40#95236a944bfd51c63a2fc65fe50a592c47168d40"
-    },
-    "cosmic-settings-config@1.11.0": {
-      "source": "git+https://github.com/pop-os/cosmic-settings-daemon#655b14fb9572dd7f7231ec6c343c63984e99741a",
-      "manifest_sha256": "ac635098f1b65dfcc5583acf41fa780d31494fa33fb5f05ea22e2f982c6ab393",
-      "license": "MPL-2.0",
-      "texts": [
-        {
-          "path": "license-texts/09e9e701e4faeca5e935232f4610b70be0e20beba83b79184841c0997167f9d4.txt",
-          "sha256": "09e9e701e4faeca5e935232f4610b70be0e20beba83b79184841c0997167f9d4",
-          "source_url": "https://github.com/pop-os/cosmic-settings-daemon/blob/655b14fb9572dd7f7231ec6c343c63984e99741a/config/src/lib.rs"
-        }
-      ],
-      "lock_source": "git+https://github.com/pop-os/cosmic-settings-daemon#655b14fb9572dd7f7231ec6c343c63984e99741a"
-    },
     "cosmic-settings-daemon@0.1.0": {
       "source": "git+https://github.com/pop-os/dbus-settings-bindings#85502fb865695a15261a80dea0eef38a8c23e349",
       "manifest_sha256": "4b8943330a5fd3239f0e161717284733256baea7e80451fcd458ffec4e75b5e7",
@@ -423,19 +349,6 @@
         }
       ],
       "lock_source": "git+https://github.com/pop-os/window_clipboard.git?tag=sctk-0.20#f68595ee0e62fbd6589f4709b5aaa5c3c7ea5f6c"
-    },
-    "switcheroo-control@0.1.0": {
-      "source": "git+https://github.com/pop-os/dbus-settings-bindings#85502fb865695a15261a80dea0eef38a8c23e349",
-      "manifest_sha256": "7727ff74e2181d8fad3adcbd270d2158a1eee685f4f7d6a382844e7ea32d573e",
-      "license": "MPL-2.0",
-      "texts": [
-        {
-          "path": "license-texts/e368885fd6ab4d78863ed9a0daac8a16b40a55c58395a9061f7c36b52a30536d.txt",
-          "sha256": "e368885fd6ab4d78863ed9a0daac8a16b40a55c58395a9061f7c36b52a30536d",
-          "source_url": "https://github.com/pop-os/dbus-settings-bindings/blob/85502fb865695a15261a80dea0eef38a8c23e349/LICENSE.md"
-        }
-      ],
-      "lock_source": "git+https://github.com/pop-os/dbus-settings-bindings#85502fb865695a15261a80dea0eef38a8c23e349"
     },
     "intl_pluralrules@7.0.2": {
       "source": "registry+https://github.com/rust-lang/crates.io-index",

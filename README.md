@@ -83,8 +83,9 @@ sudo dnf install ./cosmos-virtual-mic-0.2.0-1.x86_64.rpm
 sudo apt install ./cosmos-virtual-mic_0.2.0_amd64.deb
 
 # Or extract the binary bundle and run its per-user installer.
-tar -xzf cosmos-virtual-mic-0.2.0-linux-x86_64.tar.gz
-bash install.sh install
+mkdir cosmos-virtual-mic-0.2.0
+tar -xzf cosmos-virtual-mic-0.2.0-linux-x86_64.tar.gz -C cosmos-virtual-mic-0.2.0
+bash cosmos-virtual-mic-0.2.0/install.sh install
 ```
 
 The RPM and DEB install executables system-wide in `/usr/bin`, plus a systemd user unit, launcher, icon, and licence notices. They do not start the engine or enable login startup. Do not combine a native package with a per-user installation: both provide the same service name. Remove the old installation before changing installation methods.

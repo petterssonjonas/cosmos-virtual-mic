@@ -219,7 +219,6 @@ pub struct StatusChanges {
     discovery: Change,
     control: Change,
     backend: Change,
-    device_profile: Change,
     buses: Vec<EndpointDiagnostics>,
     routes: Vec<EndpointDiagnostics>,
 }
@@ -254,13 +253,6 @@ impl StatusChanges {
             .error("control", status.last_control_error.as_deref());
         self.backend
             .error("backend", status.backend.error.as_deref());
-        self.device_profile.error(
-            "native device profile",
-            status
-                .device_profile_change
-                .as_ref()
-                .and_then(|change| change.error.as_deref()),
-        );
         if self.backend_ready != Some(status.backend.ready) {
             write(
                 Level::Info,
@@ -459,7 +451,6 @@ mod tests {
             backend: crate::BackendStatus::default(),
             config_error: None,
             config_pending: false,
-            device_profile_change: None,
         }
     }
 

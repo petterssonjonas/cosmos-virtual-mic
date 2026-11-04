@@ -6,10 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cosmos_control::diagnostics::{self, Change, Level, StatusChanges};
-use cosmos_control::{
-    AudioDevice, Command, DeviceProfileChange, DeviceProfileRequest, DeviceProfileState, Node,
-    Profile, Response, Status,
-};
+use cosmos_control::{Command, Node, Profile, Response, Status};
 
 use crate::Options;
 #[derive(Clone, Debug)]
@@ -17,7 +14,6 @@ pub struct Snapshot {
     pub profile: Profile,
     pub status: Status,
     pub nodes: Vec<Node>,
-    pub devices: Vec<AudioDevice>,
 }
 
 #[derive(Clone, Debug)]
@@ -25,7 +21,6 @@ pub enum Reply {
     Snapshot(Arc<Snapshot>),
     Applied(Box<Status>),
     Flushed(Box<Status>),
-    DeviceProfile(DeviceProfileChange),
     Stopped,
 }
 
@@ -58,7 +53,6 @@ pub enum Operation {
     Flush,
     Start,
     Stop,
-    DeviceProfile(DeviceProfileRequest),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,14 +76,9 @@ pub struct Control {
     pub baseline: Option<Arc<Profile>>,
     pub status: Option<Status>,
     pub nodes: Vec<Node>,
-    pub devices: Vec<AudioDevice>,
-    pub device_error: Option<String>,
-    device_request: Option<DeviceProfileRequest>,
-    device_change: Option<DeviceProfileChange>,
     diagnostics: StatusChanges,
     error_diagnostics: Change,
     connection_diagnostics: Change,
-    device_diagnostics: Change,
     pub error: Option<String>,
     pub connection_error: Option<String>,
     pub notice: String,
@@ -114,14 +103,9 @@ impl Default for Control {
             baseline: None,
             status: None,
             nodes: Vec::new(),
-            devices: Vec::new(),
-            device_error: None,
-            device_request: None,
-            device_change: None,
             diagnostics: Default::default(),
             error_diagnostics: Default::default(),
             connection_diagnostics: Default::default(),
-            device_diagnostics: Default::default(),
             error: None,
             connection_error: None,
             notice: "Connecting to the engine…".into(),
@@ -161,7 +145,6 @@ impl Control {
         self.after_save.is_some()
             || self.start_pending
             || matches!(self.in_flight, Some(Operation::Start | Operation::Stop))
-            || self.device_busy()
     }
 
     pub fn retry_available(&self) -> bool {
@@ -189,64 +172,6 @@ impl Control {
         self.start_pending = true;
     }
 
-    pub fn device_busy(&self) -> bool {
-        self.device_request.is_some()
-            || matches!(self.in_flight, Some(Operation::DeviceProfile(_)))
-            || self
-                .device_change
-                .as_ref()
-                .is_some_and(|change| change.state == DeviceProfileState::Pending)
-            || self
-                .status
-                .as_ref()
-                .and_then(|status| status.device_profile_change.as_ref())
-                .is_some_and(|change| change.state == DeviceProfileState::Pending)
-    }
-
-    pub fn set_device_profile(&mut self, request: DeviceProfileRequest) -> Result<(), String> {
-        if self.action_busy() || self.save_unavailable() {
-            return Err(
-                "Wait for the engine and any current action before changing a system device."
-                    .into(),
-            );
-        }
-        if !self.status.as_ref().is_some_and(|status| {
-            status.pid == request.engine_pid
-                && status.generation == request.generation
-                && status.phase == cosmos_control::Phase::Connected
-        }) {
-            return Err("The audio connection changed. Select the device again.".into());
-        }
-        self.device_error = None;
-        self.device_change = None;
-        self.device_request = Some(request);
-        Ok(())
-    }
-
-    fn observe_device_change(&mut self, status: &Status) {
-        let Some(expected) = self
-            .device_change
-            .as_ref()
-            .filter(|change| change.state == DeviceProfileState::Pending)
-        else {
-            return;
-        };
-        if status.pid != expected.request.engine_pid {
-            self.device_error = Some("The engine restarted before confirming the system change. Check the current device profile; the request was not retried.".into());
-            self.device_change = None;
-        } else if let Some(change) = &status.device_profile_change {
-            if change.sequence == expected.sequence && change.request == expected.request {
-                if change.state != DeviceProfileState::Pending {
-                    self.device_error = change.error.clone();
-                    self.device_change = Some(change.clone());
-                }
-            } else if change.sequence > expected.sequence {
-                self.device_error = Some("Another client changed the system profile before confirmation was read. Check the current profile.".into());
-                self.device_change = None;
-            }
-        }
-    }
-
     pub fn log_changes(&mut self) {
         if let Some(status) = &self.status {
             self.diagnostics.observe(status);
@@ -255,15 +180,10 @@ impl Control {
             .error("Audio changes", self.error.as_deref());
         self.connection_diagnostics
             .error("GUI connection", self.connection_error.as_deref());
-        self.device_diagnostics
-            .error("System device", self.device_error.as_deref());
     }
 
     pub fn after_save(&mut self, action: AfterSave) -> Result<(), String> {
         self.after_save = None;
-        if self.device_busy() {
-            return Err("Wait for the system device change to finish before continuing.".into());
-        }
         self.text_edits.commit_names(&mut self.profile)?;
         if self.needs_save() && self.save_unavailable() {
             return Err("The engine is stopped or offline. Start or reconnect it to save pending changes, or explicitly discard them with Reload.".into());
@@ -338,8 +258,6 @@ impl Control {
         let operation = if self.start_pending {
             self.start_pending = false;
             Operation::Start
-        } else if let Some(request) = self.device_request.take() {
-            Operation::DeviceProfile(request)
         } else if !self.pending()
             && !self.blocked
             && self.disk_pending
@@ -384,7 +302,6 @@ impl Control {
         match result {
             Ok(Reply::Snapshot(snapshot)) => {
                 let snapshot = Arc::unwrap_or_clone(snapshot);
-                self.observe_device_change(&snapshot.status);
                 let observed = Arc::new(snapshot.profile);
                 if self.uncertain.as_deref() == Some(observed.as_ref()) || self.profile == *observed
                 {
@@ -422,7 +339,6 @@ impl Control {
                 self.disk_pending = snapshot.status.config_pending;
                 self.status = Some(snapshot.status);
                 self.nodes = snapshot.nodes;
-                self.devices = snapshot.devices;
                 self.connection_error = None;
                 self.notice =
                     "Changes are live. Settings save after two seconds of inactivity.".into();
@@ -430,7 +346,6 @@ impl Control {
             }
             Ok(Reply::Applied(status)) => {
                 if let Operation::Apply { desired, .. } = operation {
-                    self.observe_device_change(&status);
                     self.baseline = Some(desired);
                     self.uncertain = None;
                     self.blocked = false;
@@ -449,30 +364,15 @@ impl Control {
                 self.error = None;
                 self.connection_error = None;
             }
-            Ok(Reply::DeviceProfile(change)) => {
-                self.device_error = change.error.clone();
-                self.device_change = Some(change);
-                self.poll_due = true;
-            }
             Ok(Reply::Stopped) => {
                 self.stopped = true;
                 self.disk_pending = false;
                 self.status = None;
                 self.nodes.clear();
-                self.devices.clear();
-                self.device_change = None;
                 self.notice = "Engine stopped. Audio endpoints are unavailable.".into();
             }
             Err(failure) => {
-                let device_operation = matches!(operation, Operation::DeviceProfile(_));
                 let flush_operation = matches!(operation, Operation::Flush);
-                if device_operation {
-                    self.device_error = Some(format!(
-                        "System profile was not confirmed: {}. Check its current state before retrying.",
-                        failure.message()
-                    ));
-                    self.poll_due = true;
-                }
                 if let Operation::Apply { desired, .. } = operation {
                     self.blocked = true;
                     self.conflict = matches!(failure, Failure::Conflict(_));
@@ -492,21 +392,11 @@ impl Control {
                     ));
                 }
                 if matches!(failure, Failure::Transport(_) | Failure::Uncertain(_)) {
-                    if self.device_request.take().is_some()
-                        || self
-                            .device_change
-                            .as_ref()
-                            .is_some_and(|change| change.state == DeviceProfileState::Pending)
-                    {
-                        self.device_error = Some("Connection lost before the system change was confirmed. Check its current state; no request will be retried automatically.".into());
-                    }
-                    self.device_change = None;
                     self.connection_error = Some(failure.message().to_owned());
                     self.status = None;
                     self.nodes.clear();
-                    self.devices.clear();
                     self.notice = "Engine unavailable. Your changes are kept.".into();
-                } else if self.error.is_none() && !device_operation {
+                } else if self.error.is_none() {
                     self.error = Some(failure.message().to_owned());
                 }
                 // Do not close, stop, or reload following a failed flush.
@@ -547,16 +437,10 @@ fn snapshot(options: &Options) -> Result<Reply, Failure> {
     match cosmos_control::request(&options.socket, Command::List)
         .map_err(|e| Failure::Transport(e.to_string()))?
     {
-        Response::Snapshot {
-            status,
-            nodes,
-            devices,
-            ..
-        } => Ok(Reply::Snapshot(Arc::new(Snapshot {
+        Response::Snapshot { status, nodes, .. } => Ok(Reply::Snapshot(Arc::new(Snapshot {
             profile: profile(options)?,
             status,
             nodes,
-            devices,
         }))),
         Response::Error { error, .. } => Err(Failure::Rejected(error)),
         _ => Err(Failure::Rejected("Unexpected engine response".into())),
@@ -567,19 +451,6 @@ fn snapshot(options: &Options) -> Result<Reply, Failure> {
 pub fn execute(options: Options, operation: Operation) -> Result<Reply, Failure> {
     match operation {
         Operation::Poll => snapshot(&options),
-        Operation::DeviceProfile(request) => {
-            match cosmos_control::set_device_profile(&options.socket, request.clone())
-                .map_err(apply_failure)?
-            {
-                Response::DeviceProfile { change, .. } if change.request == request => {
-                    Ok(Reply::DeviceProfile(change))
-                }
-                Response::Error { error, .. } => Err(Failure::Rejected(error)),
-                _ => Err(Failure::Uncertain(
-                    "Engine did not acknowledge the system profile request".into(),
-                )),
-            }
-        }
         Operation::Apply { baseline, desired } => {
             if profile(&options)? != *baseline {
                 return Err(Failure::Conflict(
@@ -618,7 +489,7 @@ pub fn execute(options: Options, operation: Operation) -> Result<Reply, Failure>
 }
 
 fn service(action: &str) -> Result<(), Failure> {
-    const UNIT: &str = "cosmos-audio-mixer.service";
+    const UNIT: &str = "cosmos-virtual-mic.service";
     let mut child = Process::new("systemctl")
         .args(["--user", "--no-pager", "--no-ask-password", action, UNIT])
         .stdin(Stdio::null())
@@ -684,7 +555,7 @@ fn start(options: &Options) -> Result<Reply, Failure> {
                 Ok(reply) => break Ok(reply),
                 Err(error) if Instant::now() >= deadline => {
                     break Err(Failure::Transport(format!(
-                        "The engine service did not become ready: {}. Check journalctl --user -u cosmos-audio-mixer.service.",
+                        "The engine service did not become ready: {}. Check journalctl --user -u cosmos-virtual-mic.service.",
                         error.message()
                     )));
                 }
@@ -708,7 +579,7 @@ fn start(options: &Options) -> Result<Reply, Failure> {
     }
     let executable = std::env::current_exe()
         .map_err(|e| Failure::Transport(e.to_string()))?
-        .with_file_name("cosmos-engine");
+        .with_file_name("cosmos-virtual-mic-engine");
     let mut command = Process::new(executable);
     command
         .arg("run")
@@ -741,10 +612,10 @@ fn start(options: &Options) -> Result<Reply, Failure> {
     let mut child = command.spawn().map_err(|e| {
         diagnostics::write(
             Level::Error,
-            format_args!("Cannot start the sibling cosmos-engine executable: {e}"),
+            format_args!("Cannot start the sibling cosmos-virtual-mic-engine executable: {e}"),
         );
         Failure::Transport(format!(
-            "Cannot start the sibling cosmos-engine executable: {e}"
+            "Cannot start the sibling cosmos-virtual-mic-engine executable: {e}"
         ))
     })?;
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -793,7 +664,6 @@ mod tests {
             backend: BackendStatus::default(),
             config_error: None,
             config_pending: false,
-            device_profile_change: None,
         }
     }
 
@@ -802,136 +672,13 @@ mod tests {
             profile,
             status: status(generation),
             nodes: Vec::new(),
-            devices: Vec::new(),
         })))
-    }
-
-    fn device_request(control: &Control) -> DeviceProfileRequest {
-        let status = control.status.as_ref().unwrap();
-        DeviceProfileRequest {
-            engine_pid: status.pid,
-            generation: status.generation,
-            id: 17,
-            serial: 18,
-            profile_index: 0,
-        }
-    }
-
-    #[test]
-    fn lost_poll_cancels_queued_system_change_without_replay_or_losing_audio_edits() {
-        let mut control = connected();
-        control.tick();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::Poll))
-        ));
-        let request = device_request(&control);
-        control.set_device_profile(request).unwrap();
-        gain(&mut control, -9.0);
-        control.finish(Err(Failure::Transport("engine connection lost".into())));
-        assert!(control.device_request.is_none());
-        assert!(control.device_error.is_some());
-        assert_eq!(control.profile.buses[0].gain_db, -9.0);
-        control.tick();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::Poll))
-        ));
-    }
-
-    #[test]
-    fn system_profile_requires_matching_native_confirmation_before_final_actions() {
-        let mut control = connected();
-        let request = device_request(&control);
-        control.set_device_profile(request.clone()).unwrap();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::DeviceProfile(_)))
-        ));
-        let change = DeviceProfileChange {
-            sequence: 2,
-            request,
-            state: DeviceProfileState::Pending,
-            error: None,
-        };
-        control.finish(Ok(Reply::DeviceProfile(change.clone())));
-        assert!(control.after_save(AfterSave::Stop).is_err());
-        assert!(control.after_save(AfterSave::Close).is_err());
-
-        // A retained confirmation of the same target from an earlier action is not success.
-        let mut snapshot = Snapshot {
-            profile: control.profile.clone(),
-            status: status(1),
-            nodes: Vec::new(),
-            devices: Vec::new(),
-        };
-        snapshot.status.device_profile_change = Some(DeviceProfileChange {
-            sequence: 1,
-            state: DeviceProfileState::Confirmed,
-            ..change.clone()
-        });
-        control.tick();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::Poll))
-        ));
-        control.finish(Ok(Reply::Snapshot(Arc::new(snapshot.clone()))));
-        assert!(control.device_busy());
-
-        snapshot.status.device_profile_change = Some(DeviceProfileChange {
-            state: DeviceProfileState::Confirmed,
-            ..change
-        });
-        control.tick();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::Poll))
-        ));
-        control.finish(Ok(Reply::Snapshot(Arc::new(snapshot))));
-        assert!(!control.device_busy());
-        control.after_save(AfterSave::Close).unwrap();
-        assert!(matches!(control.next(), Some(Next::Close)));
-    }
-
-    #[test]
-    fn engine_restart_cannot_confirm_an_old_system_change() {
-        let mut control = connected();
-        let request = device_request(&control);
-        control.set_device_profile(request.clone()).unwrap();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::DeviceProfile(_)))
-        ));
-        control.finish(Ok(Reply::DeviceProfile(DeviceProfileChange {
-            sequence: 1,
-            request,
-            state: DeviceProfileState::Pending,
-            error: None,
-        })));
-        let mut snapshot = Snapshot {
-            profile: control.profile.clone(),
-            status: status(1),
-            nodes: Vec::new(),
-            devices: Vec::new(),
-        };
-        snapshot.status.pid += 1;
-        control.tick();
-        assert!(matches!(
-            control.next(),
-            Some(Next::Request(Operation::Poll))
-        ));
-        control.finish(Ok(Reply::Snapshot(Arc::new(snapshot))));
-        assert!(control.device_change.is_none());
-        assert!(control.device_error.is_some());
-        assert!(!control.device_busy());
     }
 
     fn connected() -> Control {
         let mut control = Control::default();
         let mut profile = Profile::default();
-        profile
-            .buses
-            .push(model::new_bus(&profile, Channels::Stereo).unwrap());
+        profile.buses[0].channels = Channels::Stereo;
         assert!(matches!(
             control.next(),
             Some(Next::Request(Operation::Poll))
@@ -1658,7 +1405,6 @@ mod tests {
             profile: saved,
             status: restarted,
             nodes: Vec::new(),
-            devices: Vec::new(),
         }))));
         assert_eq!(control.profile.buses[0].gain_db, -15.0);
         assert!(control.save_blocked());

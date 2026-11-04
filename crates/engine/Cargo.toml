@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "cosmos-virtual-mic-engine"
+path = "src/main.rs"
+
 [dependencies]
 cosmos-control = { path = "../control" }
 libc.workspace = true

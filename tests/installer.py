@@ -3,7 +3,7 @@
 """Exercise the Bash installer with native ELF fixtures and a private manager.
 
 Python is development test tooling, not an installation/runtime dependency.
-The real installer, checksum checks, file operations, and old client run here.
+The real installer, checksum checks, file operations, and installed client run here.
 Only systemctl is replaced; no command reaches the desktop service manager.
 """
 import hashlib
@@ -17,8 +17,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-APP = 'cosmos-audio-mixer'
-APP_ID = 'io.github.petterssonjonas.CosmosAudioMixer'
+APP = 'cosmos-virtual-mic'
+APP_ID = 'io.github.petterssonjonas.CosmosVirtualMic'
 UNIT = APP + '.service'
 ENGINE = r'''
 #include <stdio.h>
@@ -56,7 +56,7 @@ p = Path(os.environ['MANAGER_STATE'])
 state = json.loads(p.read_text())
 with open(os.environ['FIXTURE_LOG'], 'a') as log:
     log.write('manager:' + action + '\n')
-unit = Path(os.environ['XDG_CONFIG_HOME']) / 'systemd/user/cosmos-audio-mixer.service'
+unit = Path(os.environ['XDG_CONFIG_HOME']) / 'systemd/user/cosmos-virtual-mic.service'
 code = 0
 if action == 'show':
     if '--property=MainPID' in args:
@@ -106,7 +106,7 @@ class Fixture:
         (self.bin / 'systemctl').write_text(MANAGER)
         (self.bin / 'systemctl').chmod(0o755)
         (self.bin / 'install').write_text('''#!/usr/bin/env bash
-if [[ ${FAIL_COPY:-} && ${!#} == "$HOME/.local/bin/cosmos-engine."* ]]; then exit 5; fi
+if [[ ${FAIL_COPY:-} && ${!#} == "$HOME/.local/bin/cosmos-virtual-mic-engine."* ]]; then exit 5; fi
 exec /usr/bin/install "$@"
 ''')
         (self.bin / 'install').chmod(0o755)
@@ -124,14 +124,20 @@ exec /usr/bin/install "$@"
         self.profile = self.config / APP / 'profile.json'
         self.profile.parent.mkdir()
         self.profile.write_text('preserve user settings')
+        self.mixer_files = {
+            self.install / 'cosmos-audio-mixer': b'original mixer executable',
+            self.install / 'cosmos-engine': b'original mixer engine',
+            self.config / 'systemd/user/cosmos-audio-mixer.service': b'original mixer service',
+            self.config / 'cosmos-audio-mixer/profile.json': b'original mixer settings',
+            self.data / 'applications/io.github.petterssonjonas.CosmosAudioMixer.desktop': b'original mixer launcher',
+        }
+        for path, content in self.mixer_files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
 
     @property
     def install(self):
         return self.home / '.local/bin'
-
-    @property
-    def legacy(self):
-        return self.home / '.local/opt' / APP
 
     @property
     def unit(self):
@@ -142,7 +148,7 @@ exec /usr/bin/install "$@"
         return self.data / 'applications' / (APP_ID + '.desktop')
 
     def version(self, version):
-        for name in ('cosmos-engine', APP):
+        for name in ('cosmos-virtual-mic-engine', APP):
             shutil.copy2(self.executables[version], self.bundle / name)
         self.checksums()
 
@@ -163,7 +169,7 @@ exec /usr/bin/install "$@"
         return json.loads(self.state.read_text())
 
     def same_pair(self, version):
-        for name in ('cosmos-engine', APP):
+        for name in ('cosmos-virtual-mic-engine', APP):
             assert (self.install / name).read_bytes() == self.executables[version].read_bytes()
 
     def unchanged(self, version, state):
@@ -198,15 +204,6 @@ def main():
         f.run('install', '--enable')
         active = {'persistent': True, 'runtime': False, 'running': True}
         f.version('new')
-        overrides = f.unit.parent / (UNIT + '.d')
-        overrides.mkdir()
-        override = overrides / 'logging.conf'
-        original_override = '[Service]\nExecStart=\nExecStart=' + str(f.legacy / 'current/cosmos-engine') + ' run --log-level info\n'
-        override.write_text(original_override)
-        f.run('install', ok=False)
-        f.unchanged('old', active)
-        assert override.read_text() == original_override
-        override.unlink()
         for failure in ({'FAIL_OLD_STOP': '1'}, {'FOREIGN_UNIT': '/usr/lib/systemd/user/foreign.service'}):
             f.run('install', extra=failure, ok=False)
             f.unchanged('old', active)
@@ -239,7 +236,7 @@ def main():
         f.run('install', extra={'FAIL_COPY': '1'}, ok=False)
         assert not f.status()['running']
         backups = list((f.home / '.local').glob('.cosmos-install.*/previous'))
-        assert any((p / 'cosmos-engine').read_bytes() == f.executables['old'].read_bytes() for p in backups)
+        assert any((p / 'cosmos-virtual-mic-engine').read_bytes() == f.executables['old'].read_bytes() for p in backups)
         assert f.profile.read_text() == 'preserve user settings'
         f.run('install', '--enable')
         f.same_pair('new')
@@ -257,39 +254,14 @@ def main():
         f.same_pair('new')
         f.run('uninstall', installed=True)
         assert not f.unit.exists() and not f.desktop.exists()
-        assert not (f.install / APP).exists() and not (f.install / 'cosmos-engine').exists()
+        assert not (f.install / APP).exists() and not (f.install / 'cosmos-virtual-mic-engine').exists()
         assert f.profile.read_text() == 'preserve user settings'
         assert note.read_text() == 'unrelated data'
         assert f.status() == {'persistent': False, 'runtime': False, 'running': False}
         f.run('uninstall')
-    for versioned in (False, True):
-        with tempfile.TemporaryDirectory(prefix='cosmos-legacy-migration-', dir='/var/tmp') as temporary:
-            f = Fixture(Path(temporary))
-            old = f.legacy / 'releases/old' if versioned else f.legacy
-            old.mkdir(parents=True)
-            for name in (APP, 'cosmos-engine'):
-                shutil.copy2(f.executables['old'], old / name)
-            (f.legacy / 'keep.txt').write_text('unrelated legacy data')
-            if versioned:
-                (f.legacy / 'current').symlink_to('releases/old')
-                (f.legacy / '.cosmos-install.json').write_text('{"previous": "installer"}')
-                f.unit.parent.mkdir(parents=True)
-                f.unit.write_text('[Service]\nExecStart=' + str(old / 'cosmos-engine') + ' run\n')
-                f.state.write_text(json.dumps({'persistent': True, 'runtime': False, 'running': True}))
-            f.socket.parent.mkdir(parents=True)
-            f.socket.touch()
-            f.version('new')
-            f.run('install', '--enable')
-            f.same_pair('new')
-            assert not f.legacy.exists()
-            backup, = f.legacy.parent.glob(APP + '.backup.*')
-            assert (backup / 'files/keep.txt').read_text() == 'unrelated legacy data'
-            events = f.log.read_text().splitlines()
-            assert events.index('engine-old:stop') < events.index('manager:start')
-            assert 'engine-new:stop' not in events
-            assert f.profile.read_text() == 'preserve user settings'
-            f.run('uninstall', installed=True)
-    print('PASS: Bash install/update/remove, native launcher quoting, legacy migration, preflight and save failures, retained backups/settings')
+        for path, content in f.mixer_files.items():
+            assert path.read_bytes() == content, f'Original mixer installation changed: {path}'
+    print('PASS: Bash install/update/remove, native launcher quoting, preflight and save failures, retained backups/settings, original mixer isolation')
 
 
 if __name__ == '__main__':

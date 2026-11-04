@@ -8,7 +8,7 @@ From a host terminal:
 
 ```sh
 toolbox enter cosmos
-cd ~/Projects/cosmos-audio-mixer
+cd ~/Projects/cosmos-virtual-mic
 bash
 source ./dev-env.sh
 ```
@@ -98,7 +98,7 @@ A native UI requires actual Wayland-session checks. Before a UI launch, verify t
 
 For Rust changes, run `cargo fmt --all -- --check`, `cargo build --workspace --locked`, `cargo test --workspace --locked`, and `cargo clippy --workspace --all-targets --locked -- -D warnings`. Exercise the actual changed path as well. Avoid `--all-features` if the selected toolkit has mutually exclusive feature combinations.
 
-Development PRs run `.github/workflows/validate.yml`: the runner creates a `cosmos` toolbox from a pinned Fedora image, installs the baseline packages, and checks formatting, locked compilation, tests, and Clippy with the pinned toolchain. Project commands run inside that toolbox. This is reduced validation, not distribution packaging. Physical/audio smoke evidence is still required locally for relevant changes. Promotion to `main` still requires full validation and critical end-to-end workflows; this development-only workflow does not satisfy that release gate.
+PRs to `development` and `main` run `.github/workflows/validate.yml`: the runner creates a `cosmos` toolbox from a pinned Fedora image, installs the baseline packages, and checks formatting, locked compilation, tests, Clippy, installer failure paths, and isolated session policy. This validation does not build distribution packages. Promotions to `main` also run engine lifecycle, synthetic backend audio, and read-only device checks. Physical microphone and desktop acceptance limits remain as listed below.
 
 ## Private DSP verification
 
@@ -122,7 +122,7 @@ This standalone harness proves native DSP behavior. The separate backend harness
 
 ## Cosmos Virtual Mic
 
-Cosmos Virtual Mic has one selected microphone, one effects chain, and one public virtual microphone. The gray channel-1 card is the entire visible window, not a card inside a toolkit shell. Mixer, routing, device-management, and panel-indicator interfaces are removed. `full-mixer` preserves the previous full application at `7a5d2ad`; the microphone candidate is promoted from `mic-only` to `development` through a reviewed PR, without replacing branch history.
+Cosmos Virtual Mic has one selected microphone, one effects chain, and one public virtual microphone. The gray channel-1 card is the entire visible window, not a card inside a toolkit shell. Mixer, routing, device-management, and panel-indicator interfaces are removed. The remote `full-mixer` branch preserves the previous full application at `7a5d2ad`. Continued development uses `development`; reviewed releases use `main`.
 
 The workspace contains `cosmos-control` (toolkit-independent model and protocol), `cosmos-engine` (native audio engine), and `cosmos-virtual-mic` (libcosmic frontend). The engine package builds the `cosmos-virtual-mic-engine` executable.
 
@@ -224,9 +224,19 @@ bash "${XDG_DATA_HOME:-$HOME/.local/share}/cosmos-virtual-mic/install.sh" uninst
 
 Both executables accept `--log-level error|warn|info|debug` and `--log-stdout`. Default diagnostics use Warn on stderr. JSON client commands reject `--log-stdout`. Service logs go to the journal; GUI logging flags do not change a running service.
 
-No public distribution package, Release, service installation, or login-startup change was made during the branch conversion. The owner then requested an optimized private workstation build and SCP transfer; that delivery is recorded below. Earlier mixer test bundles are not builds of Cosmos Virtual Mic. Portable builds still require separate ABI and runtime checks.
+Public installation instructions and runtime requirements are in [README.md](README.md). Release binaries use the Fedora 45 x86_64 baseline and require glibc 2.44 or later, Wayland, PipeWire with native LV2 hosting, LSP LV2 plugins, and a systemd user manager for managed mode. The DEB is not compatible with stock Ubuntu 24.04 or 26.04. Neither a tray extension nor the COSMIC desktop is required.
 
-Runtime dependencies remain Wayland, PipeWire with native LV2 hosting, LSP LV2 plugins, and a systemd user manager for managed mode. Neither a tray extension nor the COSMIC desktop is required. Ubuntu 24.04's stock PipeWire lacks LV2 support; previous native checks used Ubuntu 26.04 or Fedora. Old mixer checks are not verification of this branch.
+### Release CD
+
+`.github/workflows/release.yml` runs only when a GitHub Release is **published**. A pushed tag alone must not build distribution packages. Publish from `main` only after reviewed promotion and passing validation. `v0.2` maps to package version `0.2.0`; later tags can use `vMAJOR.MINOR` or `vMAJOR.MINOR.PATCH`.
+
+CD builds both executables with the pinned toolchain and `Cargo.lock` inside `cosmos`. It audits dependency licences and retains notices, then creates an x86_64 RPM, amd64 DEB, and binary tarball. The assets include the release download installer and a SHA-256 manifest. They are attached to the triggering Release. Package publication and ordinary PR validation are separate.
+
+The licence audit covers the Linux normal/build graph selected by Cargo. It rejects missing or unaccepted declarations. `packaging/license-clarifications.json` records reviewed upstream omissions with exact source identities, manifest hashes, locked Git revisions, and hashed licence evidence. These records must be reviewed again when a dependency changes. The inventory is not a vulnerability scan or a legal opinion. The bundle and native packages retain the full texts; per-user installation retains `LICENSE` and the complete `THIRD-PARTY-NOTICES.txt`.
+
+`install-release.sh` is the curl-to-Bash entry point. It resolves or accepts a release tag, verifies the archive checksum, rejects unsafe archive members, and runs the existing bundle installer. The local `install.sh` still owns save-before-stop, file replacement, service installation, and removal. Run `python3 tests/release-installer.py` and `python3 tests/installer.py` for isolated install and failure-path checks.
+
+Native packages install under `/usr`, including a systemd user unit. They have no start/enable hooks. Do not mix a native package with a per-user installation. Neither method enables login startup by default. Package generation and release-asset verification must not operate the host audio graph or service manager.
 
 ### Card-only workstation candidate
 

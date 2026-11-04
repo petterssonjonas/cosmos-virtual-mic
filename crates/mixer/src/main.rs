@@ -3,7 +3,6 @@ mod app;
 mod color;
 mod connection;
 mod model;
-mod tray;
 mod view;
 
 use std::ffi::OsString;
@@ -13,13 +12,13 @@ use std::process::ExitCode;
 
 use cosmos_control::diagnostics::{self, Level, LogOptions};
 
-const USAGE: &str = "Cosmos Audio Mixer\n\
-Usage: cosmos-audio-mixer [--standalone] [--socket PATH] [--remote NAME] [--config PATH] [--log-level LEVEL] [--log-stdout]\n\n\
+const USAGE: &str = "Cosmos Virtual Mic\n\
+Usage: cosmos-virtual-mic [--standalone] [--socket PATH] [--remote NAME] [--config PATH] [--log-level LEVEL] [--log-stdout]\n\n\
 LEVEL is error|warn|info|debug (default warn). Diagnostics use stderr unless\n\
 --log-stdout is explicitly selected. The installed engine service logs to the journal.\n\
-Use journalctl --user -u cosmos-audio-mixer.service -f to follow its logs.\n\
+Use journalctl --user -u cosmos-virtual-mic.service -f to follow its logs.\n\
 Start/Stop controls the installed user service. --standalone or a custom socket,\n\
-remote, or config instead starts a sibling engine with these diagnostic options.\n\
+remote, or config instead starts cosmos-virtual-mic-engine with these diagnostic options.\n\
 Closing the window does not stop audio. No recording or automatic default-device changes.\n";
 
 #[derive(Clone, Debug)]
@@ -106,10 +105,24 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     let Some(options) = options_from(std::env::args_os().skip(1))? else {
         return Ok(());
     };
-    diagnostics::init(options.diagnostics, "cosmos-audio-mixer");
-    diagnostics::write(Level::Info, format_args!("mixer starting"));
+    diagnostics::init(options.diagnostics, "cosmos-virtual-mic");
+    diagnostics::write(
+        Level::Info,
+        format_args!("virtual microphone window starting"),
+    );
     let settings = cosmic::app::Settings::default()
-        .size(cosmic::iced::Size::new(1220.0, 820.0))
+        .size(cosmic::iced::Size::new(286.0, 760.0))
+        .size_limits(
+            cosmic::iced::Limits::NONE
+                .min_width(286.0)
+                .max_width(286.0)
+                .min_height(760.0)
+                .max_height(760.0),
+        )
+        .resizable(None)
+        // libcosmic maps client decorations to no server-side decorations.
+        .client_decorations(true)
+        .transparent(false)
         .exit_on_close(false);
     if options.uses_service() {
         cosmic::app::run_single_instance::<app::Mixer>(settings, options)?;
@@ -118,7 +131,7 @@ fn execute() -> Result<(), Box<dyn std::error::Error>> {
     }
     diagnostics::write(
         Level::Info,
-        format_args!("mixer closed; engine lifetime is independent"),
+        format_args!("virtual microphone window closed; engine lifetime is independent"),
     );
     Ok(())
 }

@@ -127,8 +127,6 @@ pub struct Observed {
     pub status: Status,
     nodes: BTreeMap<u32, Record>,
     devices: BTreeMap<u32, DeviceRecord>,
-    device_operation: Option<devices::PendingProfile>,
-    device_operation_sequence: u64,
     pub ports: BTreeMap<u32, Port>,
     pub links: BTreeMap<u32, GraphLink>,
     pub graph_revision: u64,
@@ -151,12 +149,9 @@ impl Observed {
                 backend: BackendStatus::default(),
                 config_error: None,
                 config_pending: false,
-                device_profile_change: None,
             },
             nodes: BTreeMap::new(),
             devices: BTreeMap::new(),
-            device_operation: None,
-            device_operation_sequence: 0,
             ports: BTreeMap::new(),
             links: BTreeMap::new(),
             graph_revision: 0,
@@ -167,7 +162,6 @@ impl Observed {
     }
 
     pub fn reset(&mut self) {
-        self.fail_device_profile("PipeWire disconnected during native device profile change");
         self.nodes.clear();
         self.devices.clear();
         self.ports.clear();
@@ -232,7 +226,7 @@ impl Observed {
             record
                 .properties
                 .get("cosmos.owner")
-                .is_some_and(|owner| owner == "cosmos-audio-mixer")
+                .is_some_and(|owner| owner == "cosmos-virtual-mic")
         })
     }
 
@@ -249,7 +243,7 @@ impl Observed {
             .iter()
             .filter(|(_, record)| {
                 record.properties.get("cosmos.owner").map(String::as_str)
-                    == Some("cosmos-audio-mixer")
+                    == Some("cosmos-virtual-mic")
             })
             .filter_map(|(&id, record)| {
                 record
@@ -259,7 +253,13 @@ impl Observed {
             })
     }
 
-    fn core_error(&mut self, id: u32, result: i32, message: &str) {
+    fn core_error(&mut self, id: u32, result: i32, message: &str, runtime_link: bool) {
+        if runtime_link && id != pw::core::PW_ID_CORE {
+            // The link proxy listener retains this failure for the runtime's bounded retry.
+            // It is not a failed discovery query and must not outlive the failed link.
+            self.graph_revision = self.graph_revision.wrapping_add(1);
+            return;
+        }
         if result == -libc::ENOENT || result == -libc::ESTALE {
             // A request can race object removal, which can be reported on the core.
             // Reconcile without turning missing resources into a persistent error.
@@ -415,8 +415,8 @@ impl Connection {
     ) -> Result<Self, pw::Error> {
         let context = pw::context::ContextRc::new(main_loop, None)?;
         let mut properties = pw::properties::properties! {
-            "application.name" => "Cosmos Audio Mixer engine",
-            "application.id" => "cosmos-audio-mixer",
+            "application.name" => "Cosmos Virtual Mic engine",
+            "application.id" => "cosmos-virtual-mic",
         };
         if let Some(remote) = remote {
             properties.insert("remote.name", remote);
@@ -425,9 +425,10 @@ impl Connection {
         let generation = observed.borrow().status.generation;
         let state = Rc::downgrade(observed);
         let done_state = state.clone();
+        let error_core = core.downgrade();
         let core_listener = core
             .add_listener_local()
-            .done(move |id, sequence| {
+            .done(move |id, _sequence| {
                 if id == pw::core::PW_ID_CORE
                     && let Some(state) = done_state.upgrade()
                 {
@@ -435,7 +436,6 @@ impl Connection {
                     if state.status.generation != generation {
                         return;
                     }
-                    state.device_barrier_done(sequence.seq());
                     if state.status.generation == generation
                         && state.status.phase == Phase::Connecting
                     {
@@ -444,18 +444,16 @@ impl Connection {
                     }
                 }
             })
-            .error(move |id, sequence, result, message| {
+            .error(move |id, _sequence, result, message| {
                 if let Some(state) = state.upgrade() {
                     let mut state = state.borrow_mut();
                     if state.status.generation != generation {
                         return;
                     }
-                    state.device_error(
-                        id,
-                        sequence,
-                        &format!("PipeWire device operation failed ({result}): {message}"),
-                    );
-                    state.core_error(id, result, message);
+                    let runtime_link = error_core
+                        .upgrade()
+                        .is_some_and(|core| unbound_link_error(&core, id));
+                    state.core_error(id, result, message, runtime_link);
                 }
             })
             .register();
@@ -630,11 +628,10 @@ impl Connection {
                         let param_state = info_state.clone();
                         let error_state = info_state.clone();
                         let info_bindings = Rc::downgrade(&bindings);
-                        let proxy_id = device.upcast_ref().id();
                         let proxy_listener = device
                             .upcast_ref()
                             .add_listener_local()
-                            .error(move |sequence, result, message| {
+                            .error(move |_sequence, result, message| {
                                 if let Some(state) = error_state.upgrade() {
                                     let mut state = state.borrow_mut();
                                     if state.status.generation != generation {
@@ -642,7 +639,6 @@ impl Connection {
                                     }
                                     let error =
                                         format!("native device {id} failed ({result}): {message}");
-                                    state.device_error(proxy_id, sequence, &error);
                                     if let Some(record) = state.devices.get_mut(&id) {
                                         record.error = Some(error.chars().take(512).collect());
                                     }
@@ -688,7 +684,7 @@ impl Connection {
                                     }
                                 }
                             })
-                            .param(move |sequence, parameter_type, index, _next, parameter| {
+                            .param(move |_sequence, parameter_type, index, _next, parameter| {
                                 let Some(state) = param_state.upgrade() else {
                                     return;
                                 };
@@ -698,9 +694,6 @@ impl Connection {
                                 }
                                 if let Some(record) = state.devices.get_mut(&id) {
                                     record.parameter(parameter_type, index, parameter);
-                                }
-                                if parameter_type == ParamType::Profile {
-                                    state.device_profile_seen(id, sequence);
                                 }
                                 state.graph_revision = state.graph_revision.wrapping_add(1);
                             })
@@ -803,7 +796,7 @@ impl Connection {
                                 }
                                 let owned = info.props().map_or_else(
                                     || state.links.get(&id).is_some_and(|link| link.owned),
-                                    |props| props.get("cosmos.owner") == Some("cosmos-audio-mixer"),
+                                    |props| props.get("cosmos.owner") == Some("cosmos-virtual-mic"),
                                 );
                                 state.links.insert(
                                     id,
@@ -851,7 +844,6 @@ impl Connection {
                             state.policy_revision = state.policy_revision.wrapping_add(1);
                         }
                         state.nodes.remove(&id);
-                        state.device_removed(id);
                         state.devices.remove(&id);
                         state.ports.remove(&id);
                         state.links.remove(&id);
@@ -869,6 +861,20 @@ impl Connection {
             _core: core,
             context,
         })
+    }
+}
+
+fn unbound_link_error(core: &pw::core::CoreRc, id: u32) -> bool {
+    // SAFETY: The core is held alive and this callback runs on its native main loop.
+    // The borrowed proxy and type string are inspected without dispatch or ownership changes.
+    unsafe {
+        let proxy = pw::sys::pw_core_find_proxy(core.as_raw_ptr(), id);
+        if proxy.is_null() || pw::sys::pw_proxy_get_bound_id(proxy) != u32::MAX {
+            return false;
+        }
+        let mut version = 0;
+        let kind = pw::sys::pw_proxy_get_type(proxy, &mut version);
+        !kind.is_null() && std::ffi::CStr::from_ptr(kind) == c"PipeWire:Interface:Link"
     }
 }
 
@@ -929,53 +935,6 @@ mod tests {
         let nodes = state.snapshot();
         assert_ne!(nodes[0].identity, nodes[1].identity);
     }
-    #[test]
-    fn resolved_aliases_cannot_close_a_bus_feedback_cycle() {
-        use cosmos_control::{Bus, Channels, NodeRef, Profile, Route};
-        let mut state = Observed::new();
-        state.status.phase = Phase::Connected;
-        let mut record = Record::default();
-        record.properties.insert("node.name", "fixture".into());
-        record.properties.insert("object.path", "/fixture".into());
-        state.nodes.insert(7, record);
-        let bus = NodeRef::Bus { id: "test".into() };
-        let profile = Profile {
-            buses: vec![Bus {
-                id: "test".into(),
-                name: "Test".into(),
-                channels: Channels::Mono,
-                enabled: true,
-                hidden: false,
-                muted: false,
-                gain_db: 0.0,
-                effects: vec![],
-            }],
-            routes: vec![
-                Route {
-                    id: "in".into(),
-                    from: NodeRef::Hardware {
-                        identity: BTreeMap::from([("node.name".into(), "fixture".into())]),
-                    },
-                    to: bus.clone(),
-                    enabled: true,
-                },
-                Route {
-                    id: "out".into(),
-                    from: bus,
-                    to: NodeRef::Hardware {
-                        identity: BTreeMap::from([("object.path".into(), "/fixture".into())]),
-                    },
-                    enabled: true,
-                },
-            ],
-            ..Profile::default()
-        };
-        assert!(
-            crate::runtime::validate_observed_profile(&profile, &state)
-                .unwrap_err()
-                .contains("cycle")
-        );
-    }
 
     #[test]
     fn subscriptions_follow_format_readability_through_negotiation_and_suspend() {
@@ -1010,21 +969,37 @@ mod tests {
     fn missing_object_parameters_do_not_poison_discovery_or_clear_real_errors() {
         let mut state = Observed::new();
         state.status.phase = Phase::Connected;
-        state.core_error(7, -libc::ENOENT, "format not negotiated");
+        state.core_error(7, -libc::ENOENT, "format not negotiated", false);
         assert!(state.status.discovery_error.is_none());
         assert!(state.connection_error.is_none());
         assert_eq!(state.status.phase, Phase::Connected);
 
         for result in [-libc::EACCES, -libc::EIO] {
-            state.core_error(7, result, "parameter query failed");
+            state.core_error(7, result, "parameter query failed", false);
             let error = state.status.discovery_error.clone().unwrap();
-            state.core_error(8, -libc::ENOENT, "resource removed");
+            state.core_error(8, -libc::ENOENT, "resource removed", false);
             assert_eq!(
                 state.status.discovery_error.as_deref(),
                 Some(error.as_str())
             );
             assert!(state.connection_error.is_none());
         }
+    }
+
+    #[test]
+    fn failed_runtime_links_do_not_latch_or_clear_discovery_errors() {
+        let mut state = Observed::new();
+        state.status.phase = Phase::Connected;
+        let revision = state.graph_revision;
+        state.core_error(23, -libc::EINVAL, "unknown output port", true);
+        assert!(state.status.discovery_error.is_none());
+        assert!(state.connection_error.is_none());
+        assert_ne!(state.graph_revision, revision);
+        state.core_error(7, -libc::EACCES, "discovery query denied", false);
+        let discovery_error = state.status.discovery_error.clone();
+        state.core_error(23, -libc::EINVAL, "unknown output port", true);
+        assert_eq!(state.status.discovery_error, discovery_error);
+        assert_eq!(state.status.phase, Phase::Connected);
     }
 
     #[test]
@@ -1038,6 +1013,7 @@ mod tests {
             pw::core::PW_ID_CORE,
             -libc::ENOENT,
             "raced resource removal",
+            false,
         );
         assert!(state.connection_error.is_none());
         assert_eq!(state.status.phase, Phase::Connected);
@@ -1045,9 +1021,14 @@ mod tests {
         assert_eq!(state.snapshot().len(), 1);
         assert_ne!(state.graph_revision, revision);
         assert!(state.status.discovery_error.is_none());
-        state.core_error(7, -libc::EPIPE, "individual resource failed");
+        state.core_error(7, -libc::EPIPE, "individual resource failed", false);
         assert!(state.connection_error.is_none());
-        state.core_error(pw::core::PW_ID_CORE, -libc::EPIPE, "transport closed");
+        state.core_error(
+            pw::core::PW_ID_CORE,
+            -libc::EPIPE,
+            "transport closed",
+            false,
+        );
         assert!(state.connection_error.is_some());
     }
 }

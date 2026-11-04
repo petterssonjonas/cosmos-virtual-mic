@@ -8,6 +8,7 @@ import json
 import math
 from pathlib import Path
 import shutil
+import socket
 import copy
 import sys
 import tempfile
@@ -24,7 +25,7 @@ require = PRIVATE.require
 class BackendHarness(PRIVATE.Harness):
     def __init__(self, root):
         super().__init__(root)
-        self.tools["engine"] = str(ROOT / "target/debug/cosmos-engine")
+        self.tools["engine"] = str(ROOT / "target/debug/cosmos-virtual-mic-engine")
         self.tools["pw-cli"] = "/usr/bin/pw-cli"
         self.ipc = self.runtime / "control.sock"
         self.profile_path = self.config / "profile.json"
@@ -50,8 +51,21 @@ class BackendHarness(PRIVATE.Harness):
         request.write_text(json.dumps(profile))
         return self.client("apply", request, check=check)
 
+    def request(self, payload):
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(3)
+            client.connect(str(self.ipc))
+            client.sendall(json.dumps(payload).encode() + b"\n")
+            response = bytearray()
+            while not response.endswith(b"\n"):
+                data = client.recv(65536)
+                require(data, "Engine closed before IPC response")
+                response.extend(data)
+                require(len(response) <= 2 * 1024 * 1024, "Oversized IPC response")
+            return json.loads(response)
+
     def audio(self, label, output_name, amplitude, channels=1, source_name="fixture-source",
-              duplicate=False, direct_sink=None, source_rate=RATE):
+              duplicate=False, direct_sink=None, source_rate=RATE, media_class="Audio/Source"):
         """Create an explicit synthetic source; the engine, not this test, routes it."""
         source = self.root / f"{label}-input.f32"
         capture = self.root / f"{label}-output.f32"
@@ -71,14 +85,21 @@ class BackendHarness(PRIVATE.Harness):
         second_player = None
         try:
             if source_name is not None:
-                player = self.spawn(label + "-play", "pw-cat", "--playback", "--rate", source_rate, *common,
-                                    "--properties", json.dumps({"node.name": source_name,
-                                                               "node.description": "Synthetic microphone"}),
-                                    source)
+                properties = json.dumps({"node.name": source_name,
+                                         "node.description": "Synthetic microphone",
+                                         "media.class": media_class})
+                if media_class in ("Stream/Input/Audio", "Audio/Sink"):
+                    player = self.spawn(label + "-play", "pw-cat", "--record", "--rate", source_rate,
+                                        *common, "--properties", properties, "-",
+                                        output=self.root / f"{label}-receiver.f32")
+                else:
+                    player = self.spawn(label + "-play", "pw-cat", "--playback", "--rate", source_rate,
+                                        *common, "--properties", properties, source)
                 if duplicate:
                     second_player = self.spawn(label + "-duplicate", "pw-cat", "--playback",
                                                "--rate", source_rate, *common,
-                                               "--properties", json.dumps({"node.name": source_name}),
+                                               "--properties", json.dumps({"node.name": source_name,
+                                                                          "media.class": media_class}),
                                                source)
             self.wait_for(lambda: output_name in self.nodes(), "backend recording endpoint",
                           (self.server, self.engine, recorder))
@@ -94,10 +115,16 @@ class BackendHarness(PRIVATE.Harness):
             graph = self.snapshot()
             bus_names = [item["info"]["props"]["node.name"] for item in graph
                          if item["type"] == "PipeWire:Interface:Node"
-                         and item.get("info", {}).get("props", {}).get("node.name", "").startswith("cosmos.bus.")]
+                         and item.get("info", {}).get("props", {}).get("node.name", "").startswith("cosmos.virtual-mic.")]
             require(len(bus_names) == len(set(bus_names)), "Duplicate engine-owned bus/meter nodes")
             (self.root / f"{label}-graph.json").write_text(json.dumps(graph, indent=2))
             self.last_status = self.status()
+            if source_name is not None and media_class != "Audio/Source":
+                desired = self.client("profile")["profile"]
+                require(self.apply(desired, check=False).returncode != 0,
+                        f"CLI accepted a live nonmicrophone source: {media_class}")
+                rejected = self.request({"version": 4, "command": "update", "profile": desired})
+                require("error" in rejected, f"IPC accepted a live nonmicrophone source: {media_class}")
             (self.root / f"{label}-status.json").write_text(json.dumps(self.last_status, indent=2))
         finally:
             self.stop(recorder)
@@ -124,7 +151,7 @@ class BackendHarness(PRIVATE.Harness):
     def status(self):
         return self.client("status")["status"]
 
-    def wait_bus(self, state=None, bus="voice"):
+    def wait_bus(self, state=None, bus="channel-1"):
         def ready():
             item = next((item for item in self.status()["backend"]["buses"] if item["id"] == bus), None)
             if item is None:
@@ -135,7 +162,7 @@ class BackendHarness(PRIVATE.Harness):
             if item["state"] not in ("ready", "unavailable"):
                 return None
             names = self.nodes()
-            return item if {f"cosmos.bus.{bus}.input", f"cosmos.bus.{bus}.output"} <= names.keys() else None
+            return item if {f"cosmos.virtual-mic.{bus}.input", f"cosmos.virtual-mic.{bus}.output"} <= names.keys() else None
         return self.wait_for(ready, f"bus {bus} state {state or 'endpoint available'}",
                              (self.engine,), timeout=10)
 
@@ -175,7 +202,7 @@ class BackendHarness(PRIVATE.Harness):
         path.write_bytes(array.array("f", (
             amplitude * math.sin(2 * math.pi * frequency * frame / RATE)
             for frame in range(8 * RATE))).tobytes())
-        props = {"node.name": name, **(properties or {})}
+        props = {"node.name": name, "media.class": "Audio/Source", **(properties or {})}
         return self.spawn(label, "pw-cat", "--playback", "--raw", "--format", "f32",
                           "--rate", RATE, "--channels", 1, "--channel-map", "MONO",
                           "--remote", self.socket, "--target", "0",
@@ -185,7 +212,7 @@ class BackendHarness(PRIVATE.Harness):
 def profile(channels="mono"):
     return {
         "version": 1,
-        "buses": [{"id": "voice", "name": "Voice", "channels": channels,
+        "buses": [{"id": "channel-1", "name": "Cosmos Virtual Mic", "channels": channels,
                    "enabled": True, "hidden": False, "muted": False, "gain_db": 0.0,
                    "effects": [{"id": "gate", "enabled": True, "effect": {
                        "kind": "gate", "threshold_db": -20.0, "attack_ms": 5.0,
@@ -193,60 +220,66 @@ def profile(channels="mono"):
         "devices": [],
         "routes": [{"id": "microphone", "from": {
             "kind": "hardware", "identity": {"node.name": "fixture-source"}},
-            "to": {"kind": "bus", "id": "voice"}, "enabled": True}],
+            "to": {"kind": "bus", "id": "channel-1"}, "enabled": True}],
     }
 
 
-def verify_meter_continuity(h):
-    desired = profile()
-    desired["routes"].append({"id": "second", "from": {
-        "kind": "hardware", "identity": {"node.name": "fixture-other"}},
-        "to": {"kind": "bus", "id": "voice"}, "enabled": True})
-    h.apply(desired)
-    first = h.source("meter-first", "fixture-source", 1000, 0.2)
-    second = h.source("meter-second", "fixture-other", 2000, 0.2)
-    try:
-        def levels():
-            bus = next(item for item in h.status()["backend"]["buses"] if item["id"] == "voice")
-            meter = bus["input_meter"]
-            return meter if meter and meter["fresh"] and not meter["error"] else None
-        h.wait_for(lambda: (meter := levels()) and meter["peak"][0] > 0.25,
-                   "both meter feeds", (h.engine, first, second))
-        h.stop(first)
-        h.wait_for(lambda: (meter := levels()) and 0.15 < meter["peak"][0] < 0.25,
-                   "remaining meter feed without failure backoff", (h.engine, second), timeout=1)
-    finally:
-        h.stop(first)
-        h.stop(second)
-    h.apply(profile())
-    print("PASS: input meter remains live when one of two sources leaves", flush=True)
-
-
-def verify_sibling_isolation(h):
+def verify_microphone_role(h):
     h.wait_for(lambda: "fixture-source" not in h.nodes(), "old synthetic source removal", (h.engine,))
-    desired = profile()
-    desired["buses"].append({"id": "music", "name": "Music", "channels": "mono",
-                             "enabled": True, "hidden": False, "muted": False, "effects": []})
-    desired["routes"].extend([
-        {"id": "overlap", "from": {"kind": "hardware", "identity": {
-            "node.name": "fixture-source", "device.api": "synthetic"}},
-         "to": {"kind": "bus", "id": "voice"}, "enabled": True},
-        {"id": "music", "from": {"kind": "hardware", "identity": {"node.name": "fixture-other"}},
-         "to": {"kind": "bus", "id": "music"}, "enabled": True},
-    ])
-    h.apply(desired)
-    source = h.source("overlap-source", "fixture-source", 1000, 0.4, {"device.api": "synthetic"})
+    for role in ("Stream/Output/Audio", "Stream/Input/Audio", "Audio/Sink"):
+        assert_silent(h.audio(f"reject-{role.replace('/', '-')}", "cosmos.virtual-mic.channel-1.output",
+                             0.4, media_class=role))
+        require(any(route["state"] == "error" for route in h.last_status["backend"]["routes"]),
+                f"Nonmicrophone role {role} was not reported")
+    assert_passes(h.audio("microphone-role-restored", "cosmos.virtual-mic.channel-1.output", 0.4))
+
+
+def verify_unexpected_input(h):
+    output = "cosmos.virtual-mic.channel-1.output"
+    serial = h.nodes()[output]["info"]["props"]["object.serial"]
+    extra = h.source("unexpected-input", "fixture-other", 2000, 0.2)
     try:
-        h.wait_bus(bus="music")
-        assert_passes(h.audio("unrelated-bus-survives", "cosmos.bus.music.output", 0.4,
-                             source_name="fixture-other"))
-        routes = {route["id"]: route for route in h.last_status["backend"]["routes"]}
-        require(routes["microphone"]["state"] == routes["overlap"]["state"] == "error",
-                "Resolved duplicate routes were not isolated")
-        require(routes["music"]["state"] == "ready", "Unrelated bus was disabled by duplicate routes")
+        h.wait_for(lambda: "fixture-other" in h.nodes(), "unselected synthetic source", (extra,))
+        h.link_nodes("fixture-other", "cosmos.virtual-mic.channel-1.input", 1)
+        assert_silent(h.audio("selected-plus-unexpected-input",
+                              "cosmos.virtual-mic.channel-1.output", 0.2))
+        bus = h.last_status["backend"]["buses"][0]
+        require(bus["state"] == "error" and "unexpected" in bus["error"],
+                "Unexpected input link did not produce an explicit error")
     finally:
-        h.stop(source)
-    h.apply(profile())
+        h.stop(extra)
+    assert_passes(h.audio("unexpected-input-removed", "cosmos.virtual-mic.channel-1.output", 0.2))
+    require(h.nodes()[output]["info"]["props"]["object.serial"] == serial,
+            "Unexpected-input recovery replaced the virtual microphone")
+
+
+def verify_profile_contract(h, valid):
+    persisted = h.profile_path.read_bytes()
+    mutations = {
+        "empty-buses": lambda p: p["buses"].clear(),
+        "extra-bus": lambda p: p["buses"].append(copy.deepcopy(p["buses"][0])),
+        "wrong-bus": lambda p: p["buses"][0].update(id="channel-2"),
+        "hidden-bus": lambda p: p["buses"][0].update(hidden=True),
+        "device-settings": lambda p: p["devices"].append({
+            "identity": {"node.name": "fixture-source"}, "alias": "", "enabled": True,
+            "hidden": False, "muted": False}),
+        "extra-route": lambda p: p["routes"].append(dict(copy.deepcopy(p["routes"][0]),
+                                                       id="extra", enabled=False)),
+        "bus-source": lambda p: p["routes"][0].update(
+            **{"from": {"kind": "bus", "id": "channel-1"}}),
+        "hardware-target": lambda p: p["routes"][0].update(
+            to={"kind": "hardware", "identity": {"node.name": "fixture-sink"}}),
+        "wrong-target": lambda p: p["routes"][0].update(to={"kind": "bus", "id": "channel-2"}),
+    }
+    for label, mutate in mutations.items():
+        invalid = copy.deepcopy(valid)
+        mutate(invalid)
+        require(h.apply(invalid, check=False).returncode != 0, f"Invalid {label} accepted by CLI")
+        # Send directly too: CLI validation alone cannot protect the engine.
+        response = h.request({"version": 4, "command": "apply", "profile": invalid})
+        require("error" in response, f"Invalid {label} accepted by IPC")
+        require(h.profile_path.read_bytes() == persisted, f"Rejected {label} changed saved bytes")
+        require(h.client("profile")["profile"] == valid, f"Rejected {label} changed desired state")
 
 
 def assert_passes(metrics):
@@ -260,7 +293,7 @@ def assert_silent(metrics):
 
 
 def assert_meter(h, amplitude, suppressed=False):
-    bus = next(bus for bus in h.last_status["backend"]["buses"] if bus["id"] == "voice")
+    bus = next(bus for bus in h.last_status["backend"]["buses"] if bus["id"] == "channel-1")
     input_meter, output_meter = bus["input_meter"], bus["output_meter"]
     require(input_meter is not None and output_meter is not None, "Missing actual bus meters")
     for meter in (input_meter, output_meter):
@@ -276,7 +309,7 @@ def assert_meter(h, amplitude, suppressed=False):
 
 
 def verify_boosted_limiter(h):
-    output = "cosmos.bus.voice.output"
+    output = "cosmos.virtual-mic.channel-1.output"
     for channels, ceiling_db in ((1, -1.0), (2, -6.0)):
         desired = profile("mono" if channels == 1 else "stereo")
         bus = desired["buses"][0]
@@ -287,7 +320,7 @@ def verify_boosted_limiter(h):
         h.audio(f"limiter-before-boost-{channels}", output, 0.95, channels=channels)
         serials = {
             name: h.nodes()[name]["info"]["props"]["object.serial"]
-            for name in ("cosmos.bus.voice.input", output)
+            for name in ("cosmos.virtual-mic.channel-1.input", output)
         }
         bus["gain_db"] = 12.0
         h.apply(desired)
@@ -314,18 +347,15 @@ def verify_boosted_limiter(h):
 
 
 def verify(h):
-    output = "cosmos.bus.voice.output"
+    output = "cosmos.virtual-mic.channel-1.output"
     h.start_engine()
     h.wait_for(lambda: h.status()["phase"] == "disconnected",
                "engine starts without server", (h.engine,))
     initial = h.client("profile")["profile"]
-    require(initial["buses"] == [] and initial["routes"] == [], "Defaults create audio routes")
-    large = copy.deepcopy(initial)
-    large["devices"] = [
-        {"identity": {"node.name": f"unused-{index}-" + "x" * 360}, "alias": "x" * 120,
-         "hidden": False, "enabled": False, "muted": False} for index in range(100)]
-    require(h.apply(large)["accepted"], "Large valid profile failed bounded IPC")
-    require(h.client("profile")["profile"] == large, "Large profile did not round-trip")
+    require(len(initial["buses"]) == 1 and initial["buses"][0]["id"] == "channel-1"
+            and initial["buses"][0]["name"] == "Cosmos Virtual Mic"
+            and initial["buses"][0]["channels"] == "mono" and not initial["routes"]
+            and not initial["devices"], "Defaults must create one unselected virtual microphone")
     desired = profile()
     require(h.apply(desired)["accepted"], "Valid profile rejected while server absent")
     require(h.client("profile")["profile"] == desired, "Desired profile was not retained")
@@ -338,10 +368,10 @@ def verify(h):
     assert_passes(h.audio("gate-open", output, 0.4))
     assert_meter(h, 0.4)
     assert_passes(h.audio("source-rate-44100", output, 0.4, source_rate=44100))
-    verify_meter_continuity(h)
-    verify_sibling_isolation(h)
+    verify_microphone_role(h)
+    verify_unexpected_input(h)
     verify_boosted_limiter(h)
-    meter_name = "cosmos.bus.voice.meter-input"
+    meter_name = "cosmos.virtual-mic.channel-1.meter-input"
     old_meter = h.nodes()[meter_name]
     old_serial = old_meter["info"]["props"]["object.serial"]
     h.command("pw-cli", "-r", h.socket, "destroy", old_meter["id"])
@@ -364,7 +394,8 @@ def verify(h):
     unsupported = h.spawn("six-channel-source", "pw-cat", "--playback", "--raw", "--format", "f32",
                           "--rate", RATE, "--channels", 6, "--channel-map", "FL,FR,FC,LFE,RL,RR",
                           "--remote", h.socket, "--target", "0",
-                          "--properties", '{ node.name = fixture-source }', unsupported_file)
+                          "--properties", '{ node.name = fixture-source media.class = Audio/Source }',
+                          unsupported_file)
     try:
         h.wait_for(lambda: "fixture-source" in h.nodes(), "six-channel source", (unsupported,))
         assert_silent(h.audio("unsupported-layout", output, 0.4, source_name=None))
@@ -375,8 +406,8 @@ def verify(h):
     direct = copy.deepcopy(desired)
     direct["routes"] = []
     h.apply(direct)
-    quiet = h.audio("direct-virtual-playback", output, 0.02, direct_sink="cosmos.bus.voice.input")[0]
-    require(2e-5 < quiet["ratio"] < 0.002, "Direct virtual playback sink did not process application audio")
+    assert_silent(h.audio("unselected-direct-playback", output, 0.4,
+                          direct_sink="cosmos.virtual-mic.channel-1.input"))
     h.apply(desired)
     node_serial = h.nodes()[output]["info"]["props"]["object.serial"]
 
@@ -388,7 +419,7 @@ def verify(h):
             "Live parameter edit replaced recording endpoint")
     endpoint_serials = {
         name: h.nodes()[name]["info"]["props"]["object.serial"]
-        for name in ("cosmos.bus.voice.input", output)
+        for name in ("cosmos.virtual-mic.channel-1.input", output)
     }
     for gain_db in (-12.0, -60.0, 12.0):
         changed["buses"][0]["gain_db"] = gain_db
@@ -403,9 +434,7 @@ def verify(h):
     assert_silent(h.audio("boosted-unavailable-bus", output, 0.4, source_name="different-source"))
     changed["buses"][0]["gain_db"] = 0.0
     h.apply(changed)
-    changed["buses"][0]["hidden"] = True
-    h.apply(changed)
-    assert_passes(h.audio("hidden-is-not-muted", output, 0.02))
+    verify_profile_contract(h, changed)
     changed["buses"][0]["muted"] = True
     changed["buses"][0]["gain_db"] = 12.0
     h.apply(changed)
@@ -424,20 +453,15 @@ def verify(h):
     h.apply(changed)
     assert_silent(h.audio("route-disabled", output, 0.4))
     changed["routes"][0]["enabled"] = True
-    changed["devices"] = [{"identity": {"node.name": "fixture-source"}, "alias": "My microphone",
-                           "hidden": True, "enabled": True, "muted": True}]
     h.apply(changed)
-    assert_silent(h.audio("device-muted", output, 0.4))
-    changed["devices"][0]["muted"] = False
-    h.apply(changed)
-    assert_passes(h.audio("device-hidden-alias", output, 0.4))
+    assert_passes(h.audio("input-reenabled", output, 0.02))
 
     # Validation failures must leave both accepted state and persisted bytes unchanged.
     persisted = h.profile_path.read_bytes()
     for label, invalid in (("cycle", copy.deepcopy(changed)), ("parameter", copy.deepcopy(changed))):
         if label == "cycle":
-            invalid["routes"].append({"id": "feedback", "from": {"kind": "bus", "id": "voice"},
-                                      "to": {"kind": "bus", "id": "voice"}, "enabled": True})
+            invalid["routes"].append({"id": "feedback", "from": {"kind": "bus", "id": "channel-1"},
+                                      "to": {"kind": "bus", "id": "channel-1"}, "enabled": True})
         else:
             invalid["buses"][0]["effects"][0]["effect"]["threshold_db"] = 100.0
         rejected = h.apply(invalid, check=False)
@@ -476,19 +500,7 @@ def verify(h):
         restored = h.audio(f"server-restart-{cycle}", output, 0.8)[0]
         require(0.005 < restored["rms"] < 0.1 and restored["peak"] <= 0.115,
                 "Server restart lost actual DSP processing")
-    multibus = copy.deepcopy(desired)
-    multibus["buses"].append({"id": "recording", "name": "Recording", "channels": "mono",
-                              "enabled": True, "hidden": False, "muted": False, "effects": []})
-    multibus["routes"].append({"id": "to-recording", "from": {"kind": "bus", "id": "voice"},
-                               "to": {"kind": "bus", "id": "recording"}, "enabled": True})
-    h.apply(multibus)
-    h.wait_bus(bus="recording")
-    forwarded = h.audio("named-bus-route", "cosmos.bus.recording.output", 0.8)[0]
-    require(0.005 < forwarded["rms"] < 0.1 and forwarded["peak"] <= 0.115,
-            "Named bus route did not forward processed audio")
-    multibus["routes"].append({"id": "feedback", "from": {"kind": "bus", "id": "recording"},
-                               "to": {"kind": "bus", "id": "voice"}, "enabled": True})
-    require(h.apply(multibus, check=False).returncode != 0, "Multibus feedback cycle accepted")
+    verify_profile_contract(h, desired)
 
     stereo = profile("stereo")
     h.apply(stereo)
@@ -496,7 +508,7 @@ def verify(h):
     assert_passes(h.audio("stereo-gate", output, 0.4, channels=2))
     stereo_serials = {
         name: h.nodes()[name]["info"]["props"]["object.serial"]
-        for name in ("cosmos.bus.voice.input", output)
+        for name in ("cosmos.virtual-mic.channel-1.input", output)
     }
     stereo["buses"][0]["gain_db"] = -12.0
     h.apply(stereo)
@@ -529,7 +541,7 @@ def verify(h):
     h.start_engine()
     h.apply(stereo)
     h.wait_bus("error")
-    require("cosmos.bus.voice.input" not in h.nodes() and output not in h.nodes(),
+    require("cosmos.virtual-mic.channel-1.input" not in h.nodes() and output not in h.nodes(),
             "Missing mandatory plugin published an unprocessed endpoint")
     h.client("stop")
     require(h.engine.wait(timeout=4) == 0, "Failed-plugin engine did not stop")
@@ -547,7 +559,12 @@ def verify(h):
     h.start_engine()
     require(h.status()["config_error"], "Corrupt profile not reported")
     require(h.profile_path.read_bytes() == corrupt, "Corrupt profile silently overwritten")
-    require(h.client("profile")["profile"]["buses"] == [], "Corrupt profile created audio graph")
+    recovered = h.client("profile")["profile"]
+    require(len(recovered["buses"]) == 1 and recovered["routes"] == [],
+            "Corrupt profile must recover to an unselected virtual microphone")
+    h.wait_bus("unavailable")
+    assert_silent(h.audio("corrupt-profile-silent", output, 0.4,
+                          direct_sink="cosmos.virtual-mic.channel-1.input"))
     h.apply(profile())
     require(h.client("profile")["profile"] == profile(), "Explicit corrupt-profile recovery failed")
     backups = [path for path in h.config.iterdir() if path.is_file() and path != h.profile_path]

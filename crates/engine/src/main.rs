@@ -24,14 +24,14 @@ const TICK: Duration = Duration::from_millis(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(2);
-const USAGE: &str = "Cosmos Audio Mixer engine\n\
-Usage: cosmos-engine run [--socket PATH] [--remote NAME] [--config PATH] [--log-level LEVEL] [--log-stdout]\n\
-       cosmos-engine status|list|profile|flush|stop [--socket PATH] [--log-level LEVEL]\n\
-       cosmos-engine apply|update FILE [--socket PATH] [--log-level LEVEL]\n\
+const USAGE: &str = "Cosmos Virtual Mic engine\n\
+Usage: cosmos-virtual-mic-engine run [--socket PATH] [--remote NAME] [--config PATH] [--log-level LEVEL] [--log-stdout]\n\
+       cosmos-virtual-mic-engine status|list|profile|flush|stop [--socket PATH] [--log-level LEVEL]\n\
+       cosmos-virtual-mic-engine apply|update FILE [--socket PATH] [--log-level LEVEL]\n\
 LEVEL is error|warn|info|debug (default warn). Diagnostics use stderr unless\n\
 --log-stdout is explicitly selected for run; JSON client commands reject it.\n\
-run stays in the foreground, independent of control clients. Profiles are explicit:\n\
-empty defaults create no endpoints or routes and never capture audio.\n\
+run stays in the foreground, independent of control clients.\n\
+Defaults create one silent virtual microphone. Select its hardware microphone explicitly.\n\
 update changes live audio now and saves after two idle seconds; flush saves now.\n";
 
 #[derive(Debug)]
@@ -296,12 +296,9 @@ fn run(options: Options) -> io::Result<()> {
             observed.status.backend =
                 runtime.reconcile(&store.profile, connection.as_ref(), &observed);
             let keep_running = server
-                .tick(
-                    &mut observed,
-                    &mut store,
-                    connection.as_ref(),
-                    |profile, observed| runtime.reconcile(profile, connection.as_ref(), observed),
-                )
+                .tick(&mut observed, &mut store, |profile, observed| {
+                    runtime.reconcile(profile, connection.as_ref(), observed)
+                })
                 .map_err(|error| save_before_error_exit(&mut store, error))?;
             logs.observe(&observed.status);
             if !keep_running {
@@ -323,7 +320,7 @@ fn execute() -> io::Result<()> {
     let Some(options) = options()? else {
         return Ok(());
     };
-    diagnostics::init(options.diagnostics, "cosmos-engine");
+    diagnostics::init(options.diagnostics, "cosmos-virtual-mic-engine");
     diagnostics::write(Level::Debug, format_args!("executing {}", options.command));
     if options.command == "run" {
         return run(options);

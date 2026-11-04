@@ -1,6 +1,6 @@
-# Managed by the Cosmos Audio Mixer per-user installer.
+# Managed by the Cosmos Virtual Mic per-user installer.
 [Unit]
-Description=Cosmos Audio Mixer engine
+Description=Cosmos Virtual Mic engine
 StartLimitIntervalSec=30
 StartLimitBurst=3
 

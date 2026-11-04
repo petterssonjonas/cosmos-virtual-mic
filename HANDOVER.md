@@ -1,12 +1,50 @@
-# Cosmos Audio Mixer — implementation handover
+# Cosmos Virtual Mic — implementation handover
 
 ## Resume here
 
-Read `AGENTS.md`, this file, and `DEVELOPMENT.md`. Run project commands inside `cosmos` and source `dev-env.sh` before Rust commands. Continue in `/home/jp/Projects/.worktrees/cosmos-audio-mixer/mixer-inputs-and-diagnostics`, branch `feature/mixer-inputs-and-diagnostics`, based on `origin/development` at `46aa805bdcdc54877aa39f38f3ef8added0f286a`. Do not leave this worktree. The main checkout's unrelated `.gitignore` change remains untouched.
+Run project commands inside `cosmos` and source `dev-env.sh` before Rust commands. The implementation worktree is `/home/jp/Projects/.worktrees/cosmos-audio-mixer/mic-only`, branch `mic-only`, based on `7a5d2ad`. The previous full mixer is preserved locally and remotely as the frozen `full-mixer` snapshot at that commit. Promote the microphone app to `development` through the reviewed PR and passing checks; do not force-replace history. Preserve the original checkout's unrelated `.gitignore` change.
 
-The Rust backend hosts native LSP DSP, named playback/recording endpoints, explicit routes, real input/output levels, and validated persistent profiles. The native libcosmic frontend is implemented. Physical hardware, latency, clock drift, desktop accessibility, and long-running reliability remain release validation work; do not claim release readiness.
+## Microphone-only scope — 2026-11-04
 
-## Service, persistence, and panel candidate — 2026-11-02
+The owner authorized the gray-card-only correction, restoring the original window size, supported floating placement, preservation of the full mixer as `full-mixer`, promotion of the microphone app to `development`, and an updated optimized build/SCP transfer with the `_workstation` key. This does not authorize a merge to `main`, a published Release, remote installation, or login-startup changes.
+
+- Application/executable: `cosmos-virtual-mic`; engine executable: `cosmos-virtual-mic-engine`; user unit: `cosmos-virtual-mic.service`; desktop ID: `io.github.petterssonjonas.CosmosVirtualMic`.
+- The gray channel-1 card is the entire visible window: no frosted shell, toolkit header bar, outer diagnostics, or footer. Its original 286×760 logical-pixel size is fixed. Start/Stop, a draggable gap, and top-right Close are integrated in the card. Controls and effects dialogs scroll. Close saves and exits only the frontend. Native min/max size requests match; COSMIC floating follows its fixed-size classification, but actual workstation placement remains unverified.
+- The engine enforces one visible `channel-1`, zero/one Hardware-to-channel-1 route, and no device settings. The default includes the strip's eight effects and no automatic input. Known mono/stereo microphone layouts are matched explicitly. Unknown or unsupported selections show an error without changing the profile.
+- Only the processed `cosmos.virtual-mic.channel-1.output` is a public audio device. The input is an internal capture stream. Missing, disabled, ambiguous, or failed input produces silence. A foreign input link also silences output with an explicit error; removing it recovers the selected microphone.
+- Protocol version 4 removes system device-profile mutation and its native callbacks. Read-only discovery remains. Saved profile version 1 keeps the collection shape but rejects original multi-channel mixer profiles rather than truncating them.
+- The new socket and profile use `cosmos-virtual-mic` directories. The installer uses separate executable/service/desktop names and leaves the original mixer installation and settings intact. No original profile is imported automatically.
+- Two independent source reviews covered engine/persistence/installer safety and frontend behavior. Findings about foreign input, early unsaved edits, route diagnostics, and unknown/offline state were corrected. Both reviewers reported no remaining blockers.
+
+Build and source-test commands, service behavior, and workstation acceptance are in `DEVELOPMENT.md`. Use `--standalone` for an uninstalled source build; normal installed launches control the new user service.
+
+Physical microphone behavior, real systemd start/enable/login restore, Bluetooth, clocks, latency, launcher focus, screen readers, and long-running stability remain workstation checks. Local builds use the toolbox ABI; historical portable mixer bundles are not Cosmos Virtual Mic builds.
+
+### Local verification
+
+The final card-only candidate passed formatting, locked builds, 114 Rust tests, Clippy with warnings denied, private lifecycle/save-failure checks, mono/stereo policy-startup/restart checks, and installer regressions. The policy run exposed a failed unbound route link incorrectly retained as a discovery error. The native helper classifies only unbound Link proxies; their existing runtime feedback and bounded retry remain intact, while real discovery and transport errors stay visible. The regression test preserves those distinctions. Final policy evidence: `/var/tmp/cosmos-policy-23_9qke_`.
+
+A temporary real-widget driver passed input selection, Start/Stop, effects overlays, mute/gain, name draft/final-save Close, and engine lifetime checks. Temporary source and dependencies were removed. The actual Wayland app rendered with live synthetic levels; the engine stayed running after frontend exit, then was stopped explicitly.
+
+Evidence: `/var/tmp/cosmos-backend-1foejlfw`, `/var/tmp/cosmos-policy-905yn3za`, `/var/tmp/cosmos-mic-widgets-68ez2gp_`, and `/var/tmp/cosmos-mic-ui-7qra27k1`. Final native capture: `wayland-screenshot-2026-11-04_16-41-59.png` in the last directory. Private processes are stopped; no host audio or installed service was changed.
+
+The card-only correction passed a temporary real-widget workflow at 286×760: header drag event, microphone selection, Start/Stop, EQ/dynamics modal interaction, lower-controls scrolling and limiter addition, mute/gain, and final name save on Close. Native rendering and Wayland min/max/geometry requests were observed. Evidence: `/var/tmp/cosmos-card-ui-fwfnnkwo/`, with `wayland-screenshot-2026-11-04_21-23-26.png`. Private processes are stopped; temporary drivers/dependencies are removed.
+
+### Card-only workstation candidate
+
+The optimized copy is prepared at `/home/jp/Projects/cosmos-audio-mixer-test/card-only-workstation-7pgyyq8y/`, targeting `jp@192.168.0.10:/home/jp/Downloads/cosmos-virtual-mic-card.fYsi9k/` with the workstation key. Verify the recorded source revision and checksums, not the earlier shell-containing copy below. `DEVELOPMENT.md` has the owner-run update and launch commands. Do not install, enable startup, open a desktop window, or start host audio through SSH as part of the transfer.
+
+### Earlier private workstation delivery — before the card-only correction
+
+The earlier optimized x86-64 build from the uncommitted `mic-only` source was copied with `~/.ssh/id_ed25519_workstation` to `jp@192.168.0.10:/home/jp/Downloads/cosmos-virtual-mic-test.rzgbAt/`. It still has the outer toolkit shell. The workstation reports hostname `Workstation`, Fedora 45 and glibc 2.44, matching the build toolbox baseline. Local copy: `/home/jp/Projects/cosmos-audio-mixer-test/mic-only-workstation-7xo6tity/`.
+
+The directory includes both executables, the Bash installer and data templates, compatibility metadata, licence, build provenance and checksums. Remote checksums, both executable help commands and dynamic-library resolution passed. The optimized engine also passed private mono/stereo audio, gate and foreign-input silence/recovery checks; evidence is `/var/tmp/cosmos-mic-release-smoke-r5z0ord0`. No installation, service operation, GUI launch or audio connection was run on the workstation. `DEVELOPMENT.md` has the owner-run installation commands.
+
+## Historical mixer work
+
+The sections below record earlier mixer decisions, authorizations, and evidence. They are not current branch instructions or verification of Cosmos Virtual Mic.
+
+## Service, persistence, and panel candidate — 2026-11-02 (historical)
 
 - Current authorization: create a new PR to `development` and provide compiled workstation test bundles. **Do not merge until the owner tests and approves.** Earlier merge authorization below is history, not current permission. Do not add package publishing or distribution CI/CD yet.
 - Draft [PR #3](https://github.com/petterssonjonas/cosmos-audio-mixer/pull/3) is open and unmerged.

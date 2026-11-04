@@ -21,7 +21,7 @@ use crate::meter::Meter;
 
 const RETRY_MIN: Duration = Duration::from_millis(250);
 const RETRY_MAX: Duration = Duration::from_secs(5);
-const OWNER: &str = "cosmos-audio-mixer";
+const OWNER: &str = "cosmos-virtual-mic";
 
 type Controls = Vec<(String, f32)>;
 type PortPairs = Vec<(u32, u32)>;
@@ -507,7 +507,7 @@ impl Runtime {
             for node in nodes.iter().filter(|node| observed.is_owned(node.id)) {
                 if ["input", "output", "meter-input", "meter-output"]
                     .iter()
-                    .any(|suffix| node.name == format!("cosmos.bus.{id}.{suffix}"))
+                    .any(|suffix| node.name == format!("cosmos.virtual-mic.{id}.{suffix}"))
                     && let Some(serial) = observed.node_serial(node.id)
                 {
                     self.retired_nodes.insert(node.id, serial.to_owned());
@@ -572,11 +572,7 @@ impl Runtime {
                 host.failed("native bus endpoint publication timed out".into());
             }
             if host.module.is_none() && (changed || Instant::now() >= host.retry_at) {
-                let audible = !bus.muted
-                    && !profile
-                        .routes
-                        .iter()
-                        .any(|route| route.enabled && is_bus(&route.to, &bus.id));
+                let audible = false;
                 match NativeModule::load(
                     connection.context(),
                     &module_arguments(
@@ -725,58 +721,45 @@ impl Runtime {
                 error,
             });
         }
-        // Acyclic model routes reach a fixed point in at most one pass per bus.
-        // Keep outputs closed until an explicit upstream route is actually usable.
-        let mut usable = BTreeMap::new();
-        for bus in &bus_status {
-            let incoming = profile
-                .routes
-                .iter()
-                .any(|route| route.enabled && is_bus(&route.to, &bus.id));
-            usable.insert(
-                bus.id.clone(),
-                bus.state == RuntimeState::Ready && !incoming,
-            );
-        }
-        for _ in 0..profile.buses.len() {
-            for bus in &bus_status {
-                if bus.state != RuntimeState::Ready {
-                    continue;
-                }
-                if profile
-                    .routes
-                    .iter()
-                    .zip(&route_status)
-                    .any(|(route, status)| {
-                        route.enabled
-                            && is_bus(&route.to, &bus.id)
-                            && status.state == RuntimeState::Ready
-                            && match &route.from {
-                                NodeRef::Bus { id } => usable.get(id) == Some(&true),
-                                NodeRef::Hardware { .. } => true,
-                            }
-                    })
-                {
-                    usable.insert(bus.id.clone(), true);
-                }
-            }
-        }
-        for status in &mut route_status {
-            if status.state == RuntimeState::Ready
-                && let Some(route) = profile.routes.iter().find(|route| route.id == status.id)
-                && let NodeRef::Bus { id } = &route.from
-                && usable.get(id) != Some(&true)
-            {
-                status.state = RuntimeState::Unavailable;
-                status.error = Some("source bus has no available input".into());
-            }
-        }
+        // No selection, disabled input, missing hardware or failed links must
+        // stay silent even if another client links into the private DSP input.
+        let usable = bus_status
+            .iter()
+            .map(|bus| {
+                let ready = bus.state == RuntimeState::Ready
+                    && profile
+                        .routes
+                        .iter()
+                        .zip(&route_status)
+                        .any(|(route, status)| {
+                            route.enabled
+                                && is_bus(&route.to, &bus.id)
+                                && status.state == RuntimeState::Ready
+                        });
+                (bus.id.clone(), ready)
+            })
+            .collect::<BTreeMap<_, _>>();
         for (bus, status) in profile.buses.iter().zip(&mut bus_status) {
             if !bus.enabled {
                 continue;
             }
-            let audible = usable.get(&bus.id) == Some(&true) && !bus.muted;
-            if status.state == RuntimeState::Ready && usable.get(&bus.id) != Some(&true) {
+            let unexpected_input = bus_node(bus, false, &nodes, observed).is_ok_and(|node| {
+                observed.links.values().any(|link| {
+                    !self
+                        .routes
+                        .values()
+                        .any(|route| route.pairs.contains(&(link.output_port, link.input_port)))
+                        && observed
+                            .ports
+                            .get(&link.input_port)
+                            .is_some_and(|port| port.node_id == node.id)
+                })
+            });
+            let audible = usable.get(&bus.id) == Some(&true) && !bus.muted && !unexpected_input;
+            if unexpected_input {
+                status.state = RuntimeState::Error;
+                status.error = Some("unexpected microphone input link; output is silenced".into());
+            } else if status.state == RuntimeState::Ready && usable.get(&bus.id) != Some(&true) {
                 status.state = RuntimeState::Unavailable;
                 status.error =
                     Some("no explicit input route is available; output is silenced".into());
@@ -924,7 +907,19 @@ fn next_route_retry(retries: &BTreeMap<String, Instant>, now: Instant) -> Option
 /// Validate aliases against the current generation before persisting or linking.
 /// Unavailable/ambiguous selectors remain explicit runtime states, never guesses.
 pub fn validate_observed_profile(profile: &Profile, observed: &Observed) -> Result<(), String> {
-    resolved_route_errors(profile, observed, &observed.snapshot())
+    profile.validate().map_err(|error| error.to_string())?;
+    let nodes = observed.snapshot();
+    for route in &profile.routes {
+        if let NodeRef::Hardware { identity } = &route.from {
+            for node in nodes
+                .iter()
+                .filter(|node| !observed.is_owned(node.id) && matches_identity(node, identity))
+            {
+                validate_microphone(node)?;
+            }
+        }
+    }
+    resolved_route_errors(profile, observed, &nodes)
         .into_values()
         .next()
         .map_or(Ok(()), Err)
@@ -1037,7 +1032,7 @@ fn is_bus(endpoint: &NodeRef, bus: &str) -> bool {
 
 fn bus_name(bus: &Bus, output: bool) -> String {
     format!(
-        "cosmos.bus.{}.{}",
+        "cosmos.virtual-mic.{}.{}",
         bus.id,
         if output { "output" } else { "input" }
     )
@@ -1074,6 +1069,16 @@ fn matches_identity(node: &Node, identity: &BTreeMap<String, String>) -> bool {
         .all(|(key, value)| node.identity.get(key) == Some(value))
 }
 
+fn validate_microphone(node: &Node) -> Result<(), String> {
+    if node.media_class != "Audio/Source" {
+        return Err(
+            "selected input must be an Audio/Source microphone, not an application or output"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn resolve(
     endpoint: &NodeRef,
     output: bool,
@@ -1100,7 +1105,7 @@ fn resolve(
             let node = matches.next().ok_or_else(|| {
                 (
                     RuntimeState::Unavailable,
-                    "selected device/application is unavailable; no replacement selected".into(),
+                    "selected microphone is unavailable; no replacement selected".into(),
                 )
             })?;
             if matches.next().is_some() {
@@ -1109,31 +1114,11 @@ fn resolve(
                     "selected identity is ambiguous; use more durable identity properties".into(),
                 ));
             }
-            if let Some(settings) = profile
-                .devices
-                .iter()
-                .find(|settings| matches_identity(node, &settings.identity))
-                && (!settings.enabled || settings.muted)
-            {
-                return Err((
-                    RuntimeState::Disabled,
-                    if settings.muted {
-                        "device is muted locally"
-                    } else {
-                        "device participation is disabled locally"
-                    }
-                    .into(),
-                ));
-            }
+            validate_microphone(node).map_err(|error| (RuntimeState::Error, error))?;
             node
         }
     };
-    node_ports(
-        node,
-        output,
-        output && node.media_class.starts_with("Audio/Sink"),
-        observed,
-    )
+    node_ports(node, output, false, observed)
 }
 
 fn node_ports(
@@ -1408,13 +1393,13 @@ fn module_arguments(bus: &Bus, remote: Option<&str>, audible: bool, policy_manag
     let endpoint = |output: bool| {
         let mut properties = json!({
             "node.name":bus_name(bus,output), "node.description":bus.name,
-            "media.class":if output {"Audio/Source"} else {"Audio/Sink"},
+            "media.class":if output {"Audio/Source"} else {"Stream/Input/Audio"},
             "cosmos.owner":OWNER, "cosmos.bus.id":bus.id,
             "node.autoconnect":false, "node.dont-reconnect":true,
             "node.always-process":true,"node.pause-on-idle":false,
             "audio.channels":channel_count(bus.channels),"audio.position":position,
         });
-        if !policy_managed {
+        if !output || !policy_managed {
             properties["adapter.auto-port-config"] = json!({"mode":"dsp","monitor":false});
         }
         properties
@@ -1484,12 +1469,12 @@ fn reconcile_meters(
     if host.meters.is_none() && Instant::now() >= host.retry_at {
         let input = Meter::new(
             connection.core().clone(),
-            &format!("cosmos.bus.{}.meter-input", bus.id),
+            &format!("cosmos.virtual-mic.{}.meter-input", bus.id),
             channel_count(bus.channels),
         );
         let output = Meter::new(
             connection.core().clone(),
-            &format!("cosmos.bus.{}.meter-output", bus.id),
+            &format!("cosmos.virtual-mic.{}.meter-output", bus.id),
             channel_count(bus.channels),
         );
         match (input, output) {
@@ -1576,6 +1561,53 @@ fn reconcile_meters(
 mod tests {
     use super::*;
     use cosmos_control::EffectInstance;
+
+    #[test]
+    fn selected_hardware_requires_a_microphone_source_and_matching_channel_layout() {
+        use crate::discovery::Port;
+        let mut observed = Observed::new();
+        observed.ports.insert(
+            10,
+            Port {
+                id: 10,
+                node_id: 1,
+                output: true,
+                channel: "MONO".into(),
+                monitor: false,
+            },
+        );
+        let identity = BTreeMap::from([("node.name".into(), "fixture-source".into())]);
+        let endpoint = NodeRef::Hardware {
+            identity: identity.clone(),
+        };
+        let mut node = Node {
+            id: 1,
+            generation: 0,
+            name: "fixture-source".into(),
+            description: "Synthetic microphone".into(),
+            media_class: "Audio/Source".into(),
+            identity,
+            layout: cosmos_control::Layout::new(Some(1), vec!["MONO".into()]),
+        };
+        let profile = Profile::default();
+        assert_eq!(
+            resolve(&endpoint, true, &profile, &[node.clone()], &observed).unwrap(),
+            (Channels::Mono, vec![10])
+        );
+        for role in [
+            "Audio/Sink",
+            "Audio/Source/Virtual",
+            "Stream/Output/Audio",
+            "Stream/Input/Audio",
+        ] {
+            node.media_class = role.into();
+            let failure =
+                resolve(&endpoint, true, &profile, &[node.clone()], &observed).unwrap_err();
+            assert_eq!(failure.0, RuntimeState::Error);
+            assert!(failure.1.contains("Audio/Source microphone"));
+        }
+        assert!(pair_ports((Channels::Mono, vec![10]), (Channels::Stereo, vec![20, 21])).is_err());
+    }
 
     fn bus(channels: Channels) -> Bus {
         Bus {

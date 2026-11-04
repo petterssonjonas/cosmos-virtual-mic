@@ -17,23 +17,19 @@ for directory in "$HOME" "$config" "$data" "$XDG_RUNTIME_DIR"; do
     [[ $directory == /* && $directory != / && $directory != *[[:cntrl:]]* ]] || fail "Invalid user directory: $directory"
 done
 [[ -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]] || fail 'Runtime directory must belong to you.'
-app=cosmos-audio-mixer
-id=io.github.petterssonjonas.CosmosAudioMixer
+app=cosmos-virtual-mic
+id=io.github.petterssonjonas.CosmosVirtualMic
 unit=$app.service
 bin=$HOME/.local/bin
-legacy=$HOME/.local/opt/$app
-paths=("$bin/$app" "$bin/cosmos-engine" "$config/systemd/user/$unit"
+paths=("$bin/$app" "$bin/cosmos-virtual-mic-engine" "$config/systemd/user/$unit"
        "$data/applications/$id.desktop" "$data/icons/hicolor/scalable/apps/$id.svg" "$data/$app/install.sh")
-sources=("$app" cosmos-engine unit desktop "data/$id.svg" install.sh)
+sources=("$app" cosmos-virtual-mic-engine unit desktop "data/$id.svg" install.sh)
 ctl() { timeout 25 systemctl --user --no-pager --no-ask-password "$@"; }
 exec 9>"$XDG_RUNTIME_DIR/$app-install.lock"
 flock -n 9 || fail 'Another installer is running.'
 ctl show-environment >/dev/null
 fragment=$(ctl show "$unit" --property=FragmentPath --value)
 [[ -z $fragment || $fragment -ef ${paths[2]} ]] || fail "A different installation owns the service: $fragment"
-if [[ $action == install ]] && grep -rqsF -- ".local/opt/$app" "$config/systemd/user/$unit.d"; then
-    fail "A service override still points into opt. Set its ExecStart to $bin/cosmos-engine run before installing."
-fi
 state=$(ctl is-active "$unit") || { [[ $state == inactive || $state == failed || $state == unknown || $state == activating || $state == deactivating ]] || fail "Cannot read service state: ${state:-unknown}"; }
 mkdir -p -- "$HOME/.local"
 stage=$(mktemp -d "$HOME/.local/.cosmos-install.XXXXXX")
@@ -72,12 +68,12 @@ if [[ $action == install ]]; then
     done <"$stage/SHA256SUMS"
     (cd -- "$stage" && sha256sum --check --strict SHA256SUMS)
     grep -qx "ARCH=$(uname -m)" "$stage/data/compatibility.conf" || fail 'Download the bundle for this machine architecture.'
-    for executable in "$app" cosmos-engine; do
+    for executable in "$app" cosmos-virtual-mic-engine; do
         chmod 755 "$stage/$executable"
         timeout 10 "$stage/$executable" --help >/dev/null || fail "Cannot run $executable; check its architecture and runtime libraries."
     done
     text=$(<"$stage/data/$unit")
-    value=":/usr/bin/env $(quote_unit "--chdir=$bin") ./cosmos-engine run"
+    value=":/usr/bin/env $(quote_unit "--chdir=$bin") ./cosmos-virtual-mic-engine run"
     text=${text//@EXEC_START@/"$value"}
     value="$(quote_unit "XDG_CONFIG_HOME=$config") $(quote_unit "XDG_DATA_HOME=$data")"
     printf '%s\n' "${text//@ENVIRONMENT@/"$value"}" >"$stage/unit"
@@ -90,11 +86,8 @@ if [[ $action == install ]]; then
     done
 fi
 
-# Save through the matching old client, including the earlier flat opt layout.
-old=$bin/cosmos-engine
-for candidate in "$legacy/current/cosmos-engine" "$legacy/cosmos-engine"; do
-    [[ -x $old || ! -x $candidate ]] || old=$candidate
-done
+# Save through the installed client before replacing the engine.
+old=$bin/cosmos-virtual-mic-engine
 socket=$XDG_RUNTIME_DIR/$app/control.sock
 if [[ -e $socket || -S $socket ]]; then
     [[ -x $old ]] || fail 'No installed engine client can save and stop the running engine.'
@@ -134,10 +127,5 @@ if [[ $action == install ]]; then
         ctl is-active --quiet "$unit"
     fi
 fi
-if [[ -x $legacy/cosmos-engine || -x $legacy/current/cosmos-engine ]]; then
-    backup=$(mktemp -d "$legacy.backup.XXXXXX")
-    mv -- "$legacy" "$backup/files"
-    printf 'Previous opt installation retained in %s/files\n' "$backup"
-fi
-printf '%s complete. Mixer settings were not changed.\n' "$action"
+printf '%s complete. Microphone settings were not changed.\n' "$action"
 [[ $action != install ]] || printf 'Launch: %q\nRemove: bash %q uninstall\n' "$bin/$app" "$data/$app/install.sh"

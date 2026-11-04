@@ -10,7 +10,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / "target/debug/cosmos-engine"
+BINARY = ROOT / "target/debug/cosmos-virtual-mic-engine"
 
 DAEMON = """
 context.properties = { core.daemon = true core.name = cosmos-test }
@@ -188,29 +188,22 @@ def main():
 
                 # Live edits persist complete desired state only after the idle
                 # deadline or an explicit final action. No physical audio is used.
-                config = Path(env["XDG_CONFIG_HOME"]) / "cosmos-audio-mixer/profile.json"
+                config = Path(env["XDG_CONFIG_HOME"]) / "cosmos-virtual-mic/profile.json"
                 request = directory / "requested-profile.json"
-                desired = {
-                    "version": 1, "buses": [], "routes": [],
-                    "devices": [{
-                        "identity": {"node.name": "fixture-not-present"},
-                        "alias": "Live alias", "enabled": False,
-                        "hidden": True, "muted": True,
-                    }],
-                }
+                desired = command("profile")["profile"]
 
-                def update(alias):
-                    desired["devices"][0]["alias"] = alias
+                def update(name):
+                    desired["buses"][0]["name"] = name
                     request.write_text(json.dumps(desired))
                     result = command("update", request)
                     assert result["accepted"] and result["status"]["config_pending"], result
                     assert command("profile")["profile"] == desired
 
                 assert not config.exists(), "Startup wrote default configuration"
-                update("First live alias")
+                update("First live name")
                 time.sleep(1.1)
                 assert not config.exists(), "Live update saved before two idle seconds"
-                update("Latest complete alias")
+                update("Latest complete name")
                 time.sleep(1.1)
                 assert not config.exists(), "New edit did not reset the idle deadline"
                 eventually(lambda: not command("status")["status"]["config_pending"])

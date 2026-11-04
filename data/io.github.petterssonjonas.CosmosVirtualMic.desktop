@@ -1,0 +1,11 @@
+# Managed by the Cosmos Virtual Mic per-user installer.
+[Desktop Entry]
+Type=Application
+Name=Cosmos Virtual Mic
+Comment=Process one microphone and publish a virtual microphone
+Exec=@EXEC@
+Icon=@ICON@
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+StartupNotify=true
+StartupWMClass=io.github.petterssonjonas.CosmosVirtualMic

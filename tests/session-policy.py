@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Check mixer coexistence with real WirePlumber on a synthetic-only server."""
+"""Check virtual microphone coexistence with WirePlumber on a synthetic-only server."""
 import argparse
 import importlib.util
 import json
@@ -46,16 +46,17 @@ def policy_ready(h, policy):
                for item in graph)
 
 
-def capture_bus(h, count, label):
+def capture_bus(h, count, label, silent=False):
     # WirePlumber, not pw-link, must connect this normal recording application.
     capture = h.root / f"{label}.f32"
     recorder = h.spawn(label, "pw-cat", "--record", "--raw", "--format", "f32",
                        "--rate", BACKEND.RATE, "--channels", count, "--latency", "256",
-                       "--target", "cosmos.bus.voice.output", "--sample-count", 2 * BACKEND.RATE,
+                       "--target", "cosmos.virtual-mic.channel-1.output", "--sample-count", 2 * BACKEND.RATE,
                        "--properties", "{ node.autoconnect = true }", "-", output=capture)
     # An idle public source need not process audio. Both meters must be live
     # while a real consumer is recording.
-    h.wait_for(lambda: meters_live(h, output=True), "live recording meters", (h.engine, recorder))
+    if not silent:
+        h.wait_for(lambda: meters_live(h, output=True), "live recording meters", (h.engine, recorder))
     require(recorder.wait(timeout=8) == 1, "Native finite recorder did not reach its sample limit")
     samples = BACKEND.array.array("f")
     samples.frombytes(capture.read_bytes())
@@ -64,7 +65,10 @@ def capture_bus(h, count, label):
     for channel in range(count):
         steady = samples[BACKEND.RATE * count + channel::count]
         rms = BACKEND.math.sqrt(sum(value * value for value in steady) / len(steady))
-        require(0.25 < rms < 0.31, f"Application did not receive processed audio: RMS {rms}")
+        if silent:
+            require(max(map(abs, steady)) < 1e-8, f"Unselected microphone leaked input: RMS {rms}")
+        else:
+            require(0.25 < rms < 0.31, f"Application did not receive processed audio: RMS {rms}")
 
 
 def verify_daemon_metadata(root, engine):
@@ -89,7 +93,7 @@ def verify_daemon_metadata(root, engine):
         finally:
             h.env["PIPEWIRE_CONFIG_DIR"] = str(h.config)
         h.apply(BACKEND.profile())
-        BACKEND.assert_passes(h.audio("unmanaged-default-metadata", "cosmos.bus.voice.output", 0.4))
+        BACKEND.assert_passes(h.audio("unmanaged-default-metadata", "cosmos.virtual-mic.channel-1.output", 0.4))
         BACKEND.assert_meter(h, 0.4)
         require(h.status()["discovery_error"] is None, "Unmanaged graph has a discovery failure")
         print("PASS: daemon-owned metadata does not require a session manager", flush=True)
@@ -156,7 +160,7 @@ wireplumber.profiles = { policy = {
         h.spawn("source", "pw-cat", "--playback", "--raw", "--format", "f32",
                 "--rate", BACKEND.RATE, "--channels", count, "--latency", "256",
                 "--channel-map", "MONO" if count == 1 else "FL,FR", "--target", "0", "--properties",
-                '{ node.name = fixture-source item.features.no-format = true '
+                '{ node.name = fixture-source media.class = Audio/Source item.features.no-format = true '
                 'adapter.auto-port-config = { mode = dsp } }', source)
         h.wait_for(lambda: meters_live(h), "processed audio and live meters before policy restart",
                    (h.engine,), timeout=10)
@@ -186,17 +190,29 @@ wireplumber.profiles = { policy = {
         h.command("wpctl", "set-default", h.nodes()["fixture-sink-b"]["id"])
         h.wait_for(lambda: linked_to(h, "fixture-player", "fixture-sink-b"),
                    "desktop playback after policy restart", (policy, player, h.engine))
+        h.wait_for(lambda: meters_live(h), "microphone recovery after policy restart",
+                   (policy, player, h.engine), timeout=10)
         capture_bus(h, count, "capture-after-policy-restart")
-        # Exercise the public virtual sink too, without an engine-owned source route.
+        # An unselected microphone must not become an application-playback bypass.
         desired = BACKEND.profile(channels)
         desired["routes"] = []
         h.apply(desired)
+        h.wait_bus("unavailable")
         direct = h.spawn("direct-playback", "pw-cat", "--playback", "--raw", "--format", "f32",
                          "--rate", BACKEND.RATE, "--channels", count, "--latency", "256",
-                         "--target", "cosmos.bus.voice.input",
-                         "--properties", "{ node.autoconnect = true }", source)
-        capture_bus(h, count, "capture-direct-playback")
+                         "--target", "0", "--properties",
+                         '{ node.name = direct-player node.autoconnect = false '
+                         'adapter.auto-port-config = { mode = dsp } }', source)
+        h.link_nodes("direct-player", "cosmos.virtual-mic.channel-1.input", count)
+        capture_bus(h, count, "capture-unselected-input", silent=True)
         require(direct.poll() is None, "Direct playback ended during recording")
+        owned = [item for item in h.snapshot() if item["type"] == "PipeWire:Interface:Node"
+                 and item.get("info", {}).get("props", {}).get("node.name", "").startswith(
+                     "cosmos.virtual-mic.")]
+        require(sum(item["info"]["props"].get("media.class") == "Audio/Source"
+                    for item in owned) == 1, "Engine must publish exactly one microphone")
+        require(not any(item["info"]["props"].get("media.class") == "Audio/Sink"
+                        for item in owned), "Engine must not publish a playback device")
         require(h.status()["discovery_error"] is None, "Policy change left a discovery failure")
         (root / "final-status.json").write_text(json.dumps(h.status(), indent=2))
         (root / "final-graph.json").write_text(json.dumps(h.snapshot(), indent=2))
@@ -212,7 +228,7 @@ wireplumber.profiles = { policy = {
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", type=Path, default=ROOT / "target/debug/cosmos-engine")
+    parser.add_argument("--engine", type=Path, default=ROOT / "target/debug/cosmos-virtual-mic-engine")
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args()
     root = Path(tempfile.mkdtemp(prefix="cosmos-policy-", dir="/var/tmp"))

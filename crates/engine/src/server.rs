@@ -10,7 +10,7 @@ use cosmos_control::{
     Response, VERSION,
 };
 
-use crate::discovery::{Connection, Observed};
+use crate::discovery::Observed;
 use crate::persistence::Store;
 
 const MAX_CLIENTS: usize = 8;
@@ -79,7 +79,6 @@ impl Client {
         observed: &mut Observed,
         store: &mut Store,
         reconcile: &mut impl FnMut(&Profile, &Observed) -> BackendStatus,
-        connection: Option<&Connection>,
         now: Instant,
         stopping: &mut bool,
     ) -> io::Result<bool> {
@@ -102,11 +101,7 @@ impl Client {
                         {
                             Ok(Some(request)) => {
                                 let response = match request.command {
-                                    Command::Apply
-                                    | Command::Update
-                                    | Command::SetDeviceProfile
-                                        if *stopping =>
-                                    {
+                                    Command::Apply | Command::Update if *stopping => {
                                         Response::Error {
                                             version: VERSION,
                                             error: "engine is stopping; changes are not accepted"
@@ -208,33 +203,6 @@ impl Client {
                                             }
                                         }
                                     }
-                                    Command::SetDeviceProfile => {
-                                        let selection =
-                                            request.device_profile.ok_or_else(|| {
-                                                control::invalid(
-                                                    "set_device_profile requires device_profile",
-                                                )
-                                            })?;
-                                        let result = connection
-                                            .ok_or_else(|| "PipeWire is disconnected".to_owned())
-                                            .and_then(|connection| {
-                                                connection.set_device_profile(observed, selection)
-                                            });
-                                        match result {
-                                            Ok(change) => Response::DeviceProfile {
-                                                version: VERSION,
-                                                change,
-                                            },
-                                            Err(error) => {
-                                                observed.status.last_control_error =
-                                                    Some(error.clone());
-                                                Response::Error {
-                                                    version: VERSION,
-                                                    error,
-                                                }
-                                            }
-                                        }
-                                    }
                                     command => Response::Snapshot {
                                         version: VERSION,
                                         status: observed.status.clone(),
@@ -310,11 +278,9 @@ impl Server {
         &mut self,
         observed: &mut Observed,
         store: &mut Store,
-        connection: Option<&Connection>,
         mut reconcile: impl FnMut(&Profile, &Observed) -> BackendStatus,
     ) -> io::Result<bool> {
         let now = Instant::now();
-        observed.expire_device_profile(now);
         store.report_status(&mut observed.status);
         if self.stopping_at.is_none() {
             for _ in 0..MAX_ACCEPTS_PER_TICK {
@@ -357,14 +323,7 @@ impl Server {
         let mut stopping = self.stopping_at.is_some();
         self.clients.retain_mut(|client| {
             // One failed/disconnected client must not stop the engine or other clients.
-            let keep = match client.poll(
-                observed,
-                store,
-                &mut reconcile,
-                connection,
-                now,
-                &mut stopping,
-            ) {
+            let keep = match client.poll(observed, store, &mut reconcile, now, &mut stopping) {
                 Ok(keep) => keep,
                 Err(error) => {
                     record_control_error(observed, "control client failed", &error);
@@ -412,17 +371,10 @@ mod tests {
         directory.join("profile.json")
     }
 
-    fn desired(alias: &str) -> Profile {
-        Profile {
-            devices: vec![control::DeviceSettings {
-                identity: [("node.name".into(), "fixture-source".into())].into(),
-                alias: alias.into(),
-                enabled: false,
-                hidden: true,
-                muted: true,
-            }],
-            ..Profile::default()
-        }
+    fn desired(name: &str) -> Profile {
+        let mut profile = Profile::default();
+        profile.buses[0].name = name.into();
+        profile
     }
 
     fn exchange(
@@ -440,7 +392,6 @@ mod tests {
             version: VERSION,
             command,
             profile,
-            device_profile: None,
         };
         peer.write_all(&control::encode(&request, MAX_REQUEST_BYTES).unwrap())
             .unwrap();
@@ -461,7 +412,6 @@ mod tests {
                     reconciled.push(profile.clone());
                     BackendStatus::default()
                 },
-                None,
                 now,
                 stopping,
             )

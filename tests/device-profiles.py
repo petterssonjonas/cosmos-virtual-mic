@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MPL-2.0
-"""Native SPA Device off/on and rejection regression; never connects to host audio.
+"""Verify OS device-profile mutations are rejected on a synthetic-only server.
 
-Run after building cosmos-engine: python3 tests/device-profiles.py
-The tiny C fixture is compiled into the test's temporary directory using pkg-config
-libpipewire-0.3. No fixture binaries or OS device choices are saved in the repo.
+Run after building cosmos-virtual-mic-engine: python3 tests/device-profiles.py
+The native fixture remains isolated from host devices and session policy.
 """
 import importlib.util
 import json
 from pathlib import Path
-import os
-import signal
 import shlex
 import socket
 import subprocess
 import sys
 import tempfile
-import time
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("lifecycle", ROOT / "tests/engine-lifecycle.py")
 LIFECYCLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(LIFECYCLE)
-VERSION = 3
+VERSION = 4
 
 
 def main():
@@ -67,7 +63,7 @@ def main():
                 return next((device for device in devices()
                              if device["name"] == "cosmos.profile.fixture"
                              and len(device["profiles"]) == 5
-                             and device["readable"] and device["writable"]), None)
+                             and device["readable"]), None)
 
             def selection(index, **overrides):
                 device = LIFECYCLE.eventually(ready_device)
@@ -77,29 +73,6 @@ def main():
                 result.update(overrides)
                 return result
 
-            def begin(index):
-                selected = selection(index)
-                started = time.monotonic()
-                response = request("set_device_profile", device_profile=selected)
-                assert time.monotonic() - started < 1, "native change blocked IPC"
-                assert response["change"]["state"] == "pending", response
-                assert response["change"]["request"] == selected
-                return response["change"]
-
-            def finished(change, expected):
-                def done():
-                    state = request("status")["status"]["device_profile_change"]
-                    if state and state["sequence"] == change["sequence"] and state["request"] == change["request"]:
-                        return state if state["state"] != "pending" else None
-                    return None
-                state = LIFECYCLE.eventually(done, timeout=8)
-                assert state["state"] == expected, state
-                assert bool(state["error"]) == (expected == "failed"), state
-                return state
-
-            def endpoints_present():
-                names = {node["name"] for node in request("list")["nodes"]}
-                return {"cosmos.profile.input", "cosmos.profile.output"} <= names
 
             def endpoints_absent():
                 names = {node["name"] for node in request("list")["nodes"]}
@@ -116,63 +89,20 @@ def main():
                 assert endpoints_absent()
                 saved = request("get_profile")["profile"]
 
-                on = begin(1)
-                finished(on, "confirmed")
-                LIFECYCLE.eventually(endpoints_present)
-                assert not ready_device()["disabled"]
-                off = begin(0)
-                finished(off, "confirmed")
-                LIFECYCLE.eventually(endpoints_absent)
-                disabled = LIFECYCLE.eventually(ready_device)
-                assert disabled["disabled"] and disabled["profiles"] == initial["profiles"], disabled
-                # Restore is an explicitly selected advertised profile, never a guessed default.
-                restored = begin(1)
-                finished(restored, "confirmed")
-                assert restored["sequence"] > off["sequence"] > on["sequence"]
-                LIFECYCLE.eventually(endpoints_present)
-                assert request("get_profile")["profile"] == saved
-
-                for selected in (selection(1, generation=initial["generation"] - 1),
+                # Even a fresh advertised profile selection must not mutate OS hardware.
+                for selected in (selection(1), selection(0), selection(999), selection(-1),
+                                 selection(1, generation=initial["generation"] - 1),
                                  selection(1, serial=initial["serial"] + 1),
-                                 selection(1, engine_pid=engine.pid + 1),
-                                 selection(999), selection(2), selection(-1)):
+                                 selection(1, engine_pid=engine.pid + 1)):
                     response = request("set_device_profile", device_profile=selected)
                     assert "error" in response, response
-                assert ready_device()["current_profile"] == 1
-
-                rejected = begin(3)
-                failure = finished(rejected, "failed")
-                assert "-5" in failure["error"] or "Input/output" in failure["error"], failure
-                assert request("status")["status"]["last_control_error"]
-                assert ready_device()["current_profile"] == 1
-                stalled = begin(4)
-                # A second action cannot replace a pending native target.
-                assert "error" in request("set_device_profile", device_profile=selection(0))
-                assert request("list")["status"]["pid"] == engine.pid
-                failure = finished(stalled, "failed")
-                assert "timed out" in failure["error"], failure
-
-                removed = begin(4)
-                os.kill(daemon.pid, signal.SIGUSR1)
-                failure = finished(removed, "failed")
-                assert "removed" in failure["error"], failure
-                LIFECYCLE.eventually(lambda: not devices())
-                os.kill(daemon.pid, signal.SIGUSR2)
-                replaced = LIFECYCLE.eventually(ready_device)
-                assert replaced["serial"] != initial["serial"]
-                assert "error" in request("set_device_profile", device_profile=dict(
-                    engine_pid=engine.pid, generation=replaced["generation"], id=replaced["id"],
-                    serial=initial["serial"], profile_index=1))
-                disconnected = begin(4)
-                LIFECYCLE.terminate(daemon)
-                failure = finished(disconnected, "failed")
-                assert "disconnected" in failure["error"], failure
-                assert devices() == []
+                    assert ready_device()["current_profile"] == 0
+                    assert endpoints_absent()
+                    assert request("get_profile")["profile"] == saved
                 request("stop")
                 assert engine.wait(timeout=4) == 0
-                print("PASS: native Device discovery while off; explicit input/output off/on; "
-                      "serial/generation/availability validation; saved-profile isolation; "
-                      "native rejection, timeout, removal, disconnect; nonblocking IPC")
+                print("PASS: native Device discovery is read-only; OS profile mutations rejected; "
+                      "saved microphone profile and native off state unchanged")
             except BaseException:
                 print(f"Native fixture exit status: {daemon.poll() if 'daemon' in locals() else 'not launched'}")
                 log.flush()

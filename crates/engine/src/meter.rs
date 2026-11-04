@@ -198,7 +198,7 @@ pub struct Meter {
 impl Meter {
     pub fn new(core: pw::core::CoreRc, node_name: &str, channels: u32) -> Result<Self, String> {
         let bus_id = node_name
-            .strip_prefix("cosmos.bus.")
+            .strip_prefix("cosmos.virtual-mic.")
             .and_then(|name| {
                 name.strip_suffix(".meter-input")
                     .or_else(|| name.strip_suffix(".meter-output"))
@@ -236,7 +236,7 @@ impl Meter {
                 "audio.channels" => channels.to_string(),
                 "audio.position" => positions,
                 "adapter.auto-port-config" => "{ mode = dsp }",
-                "cosmos.owner" => "cosmos-audio-mixer",
+                "cosmos.owner" => "cosmos-virtual-mic",
                 "cosmos.bus.id" => bus_id,
             },
         )

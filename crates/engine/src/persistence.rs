@@ -26,7 +26,7 @@ pub fn default_path() -> io::Result<PathBuf> {
     if !base.is_absolute() {
         return Err(control::invalid("configuration home must be absolute"));
     }
-    Ok(base.join("cosmos-audio-mixer/profile.json"))
+    Ok(base.join("cosmos-virtual-mic/profile.json"))
 }
 
 fn user_id() -> u32 {
@@ -368,7 +368,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control::{Bus, Channels, DeviceSettings, Effect, EffectInstance, NodeRef, Route};
+    use control::{Bus, Channels, Effect, EffectInstance, NodeRef, Route};
 
     fn temporary_config() -> PathBuf {
         let directory = PathBuf::from("/var/tmp").join(format!(
@@ -386,11 +386,11 @@ mod tests {
         Profile {
             version: control::model::PROFILE_VERSION,
             buses: vec![Bus {
-                id: "voice".into(),
+                id: "channel-1".into(),
                 name: "Saved voice".into(),
                 channels: Channels::Stereo,
                 enabled: false,
-                hidden: true,
+                hidden: false,
                 muted: true,
                 gain_db,
                 effects: vec![
@@ -452,17 +452,13 @@ mod tests {
                     },
                 ],
             }],
-            devices: vec![DeviceSettings {
-                identity: identity.clone(),
-                alias: "Saved hardware".into(),
-                enabled: false,
-                hidden: true,
-                muted: true,
-            }],
+            devices: Vec::new(),
             routes: vec![Route {
                 id: "input".into(),
                 from: NodeRef::Hardware { identity },
-                to: NodeRef::Bus { id: "voice".into() },
+                to: NodeRef::Bus {
+                    id: "channel-1".into(),
+                },
                 enabled: false,
             }],
         }

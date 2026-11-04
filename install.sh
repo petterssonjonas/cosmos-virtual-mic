@@ -22,8 +22,9 @@ id=io.github.petterssonjonas.CosmosVirtualMic
 unit=$app.service
 bin=$HOME/.local/bin
 paths=("$bin/$app" "$bin/cosmos-virtual-mic-engine" "$config/systemd/user/$unit"
-       "$data/applications/$id.desktop" "$data/icons/hicolor/scalable/apps/$id.svg" "$data/$app/install.sh")
-sources=("$app" cosmos-virtual-mic-engine unit desktop "data/$id.svg" install.sh)
+       "$data/applications/$id.desktop" "$data/icons/hicolor/scalable/apps/$id.svg" "$data/$app/install.sh"
+       "$data/$app/LICENSE" "$data/$app/THIRD-PARTY-NOTICES.txt")
+sources=("$app" cosmos-virtual-mic-engine unit desktop "data/$id.svg" install.sh LICENSE THIRD-PARTY-NOTICES.txt)
 ctl() { timeout 25 systemctl --user --no-pager --no-ask-password "$@"; }
 exec 9>"$XDG_RUNTIME_DIR/$app-install.lock"
 flock -n 9 || fail 'Another installer is running.'

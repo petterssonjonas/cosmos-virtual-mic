@@ -112,7 +112,9 @@ exec /usr/bin/install "$@"
         (self.bin / 'install').chmod(0o755)
         shutil.copy2(ROOT / 'install.sh', self.bundle / 'install.sh')
         shutil.copytree(ROOT / 'data', self.bundle / 'data')
-        (self.bundle / 'data/compatibility.conf').write_text('ARCH=' + platform.machine() + '\nGLIBC_MIN=2.39\n')
+        shutil.copy2(ROOT / 'LICENSE', self.bundle / 'LICENSE')
+        (self.bundle / 'THIRD-PARTY-NOTICES.txt').write_text('Fixture dependency licence notices.\n')
+        (self.bundle / 'data/compatibility.conf').write_text('ARCH=' + platform.machine() + '\nGLIBC_MIN=2.44\n')
         source = root / 'fixture.c'
         source.write_text(ENGINE)
         self.executables = {}
@@ -187,6 +189,8 @@ def main():
         f.run('install')
         f.same_pair('old')
         assert f.status() == {'persistent': False, 'runtime': False, 'running': False}
+        for name in ('LICENSE', 'THIRD-PARTY-NOTICES.txt'):
+            assert (f.data / APP / name).read_bytes() == (f.bundle / name).read_bytes()
         verified = subprocess.run(['systemd-analyze', '--user', 'verify', '--man=no', str(f.unit)],
                                   env=f.env | {'SYSTEMD_UNIT_PATH': str(f.unit.parent) + ':/usr/lib/systemd/user',
                                                'SYSTEMD_USER_GENERATOR_PATH': '/dev/null'},
@@ -221,7 +225,7 @@ def main():
         f.version('new')
         compatibility = f.bundle / 'data/compatibility.conf'
         original = compatibility.read_text()
-        compatibility.write_text('ARCH=wrong\nGLIBC_MIN=2.39\n')
+        compatibility.write_text('ARCH=wrong\nGLIBC_MIN=2.44\n')
         f.checksums()
         f.run('install', ok=False)
         f.unchanged('old', active)
@@ -255,6 +259,8 @@ def main():
         f.run('uninstall', installed=True)
         assert not f.unit.exists() and not f.desktop.exists()
         assert not (f.install / APP).exists() and not (f.install / 'cosmos-virtual-mic-engine').exists()
+        assert not (f.data / APP / 'LICENSE').exists()
+        assert not (f.data / APP / 'THIRD-PARTY-NOTICES.txt').exists()
         assert f.profile.read_text() == 'preserve user settings'
         assert note.read_text() == 'unrelated data'
         assert f.status() == {'persistent': False, 'runtime': False, 'running': False}

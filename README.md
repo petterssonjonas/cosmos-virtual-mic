@@ -20,6 +20,8 @@ The app does not change your default audio devices, hardware names, or sound-car
 
 Release binaries target **Linux x86_64**, with **glibc 2.44 or later**. They use Wayland, PipeWire with native LV2 filter hosting, LSP LV2 plugins, and a systemd user manager. They do not require the COSMIC desktop or a tray extension.
 
+**Toolbox is not required** to install, run, or compile the app. It is used only for the maintainer's development environment and the Fedora build environment in GitHub CI/CD.
+
 The build baseline is Fedora 45. The DEB requires a system with the same or newer library ABI, such as Ubuntu 26.10 or a suitable Debian installation. It is **not** a package for stock Ubuntu 24.04 or 26.04. A DEB file does not make these binaries compatible with older libraries. Native distribution packages install their declared dependencies; the per-user installer does not install system packages.
 
 On Fedora 45, install the runtime packages before a per-user installation:
@@ -125,9 +127,22 @@ bash "${XDG_DATA_HOME:-$HOME/.local/share}/cosmos-virtual-mic/install.sh" uninst
 
 For native packages, use your package manager after you stop the engine and close the window.
 
+## Build from source
+
+Use a normal Linux terminal with Rustup and the native development libraries installed. The Rust version is pinned in `rust-toolchain.toml`. Fedora package names are listed in `dependencies-fedora.txt`; other distributions need the corresponding development packages and PipeWire with native LV2 support.
+
+```sh
+git clone https://github.com/petterssonjonas/cosmos-virtual-mic.git
+cd cosmos-virtual-mic
+cargo build --workspace --release --locked
+./target/release/cosmos-virtual-mic --standalone
+```
+
+`--standalone` runs the sibling engine without an installed systemd service. Close saves settings and leaves the engine running; use **Stop engine** to stop it. A source build uses your system's libraries, not the downloadable binaries' Fedora ABI baseline. Do not source `dev-env.sh` for a normal host build; that script is only for the maintainer's toolbox.
+
 ## Development and releases
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for the pinned Rust toolchain, `cosmos` toolbox, native dependencies, and isolated audio checks. `development` is the continued development branch; `main` is the release branch. The previous full mixer is preserved on [`full-mixer`](https://github.com/petterssonjonas/cosmos-virtual-mic/tree/full-mixer).
+See [DEVELOPMENT.md](DEVELOPMENT.md) for maintainer workstation setup, CI, native dependencies, and isolated audio checks. GitHub jobs use a Fedora toolbox to keep their native-library baseline consistent on Ubuntu runners; this is not an end-user requirement. `development` is the continued development branch; `main` is the release branch. The previous full mixer is preserved on [`full-mixer`](https://github.com/petterssonjonas/cosmos-virtual-mic/tree/full-mixer).
 
 Publishing a GitHub Release starts release CD. It builds the x86_64 RPM, DEB, and binary tarball, then attaches them, the download installer, and checksums to that release. Pushing a tag alone does not build distribution packages. PR validation is separate from release CD.
 

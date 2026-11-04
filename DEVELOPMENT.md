@@ -1,6 +1,6 @@
 # Development environment
 
-Run project commands inside the Fedora `cosmos` toolbox. The application itself is not intended to require Toolbox, COSMIC desktop services, or Flatpak.
+This document describes the maintainer's Fedora `cosmos` toolbox and the matching GitHub CI/CD build environment. Run maintainer project commands there. Toolbox is not an application or compiler requirement: end users can install, run, and build the app on a normal Linux system. See the native source-build instructions in [README.md](README.md). COSMIC desktop services and Flatpak are not required.
 
 ## Enter and configure
 

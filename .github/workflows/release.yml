@@ -1,0 +1,104 @@
+name: Publish release packages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and inspect native release assets (cosmos)
+    if: ${{ !github.event.release.draft && !github.event.release.prerelease }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.assets.outputs.artifact-id }}
+      commit: ${{ steps.gate.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Create the pinned Fedora 45 cosmos toolbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman podman-toolbox
+          toolbox create --assumeyes --container cosmos --image registry.fedoraproject.org/fedora-toolbox@sha256:bb687ae7bbfc8b957b1ac04bb0fd92f8e443c657220e863cfdf76a692342d663
+          toolbox run --container cosmos sudo dnf install -y python3 git
+      - name: Gate the exact published Release inside cosmos
+        id: gate
+        run: |
+          toolbox run --container cosmos env \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_EVENT_PATH="$GITHUB_EVENT_PATH" \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" GITHUB_SHA="$GITHUB_SHA" \
+            python3 packaging/release.py gate
+      - name: Install native build and package tools
+        run: |
+          # shellcheck disable=SC2016
+          # Variables in this script expand inside the toolbox, not on the runner.
+          toolbox run --container cosmos bash -euo pipefail -c '
+            mapfile -t packages < dependencies-fedora.txt
+            sudo dnf install -y "${packages[@]}" rustup python3 rpm-build dpkg binutils cpio desktop-file-utils systemd
+            rpm -q "${packages[@]}" rustup python3 rpm-build dpkg binutils cpio desktop-file-utils systemd
+            source ./dev-env.sh
+            /usr/bin/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
+            toolchain=$(python3 -c "import tomllib; print(tomllib.load(open(\"rust-toolchain.toml\", \"rb\"))[\"toolchain\"][\"channel\"])")
+            "$CARGO_HOME/bin/rustup" toolchain install "$toolchain" --profile minimal --component rustfmt,clippy,rust-src,rust-analyzer
+          '
+      - name: Audit licenses, build locked binaries, package and smoke extracted payloads
+        run: |
+          toolbox run --container cosmos env \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_EVENT_PATH="$GITHUB_EVENT_PATH" \
+            GITHUB_SERVER_URL="$GITHUB_SERVER_URL" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_SHA="$GITHUB_SHA" bash packaging/build.sh
+      - name: Retain the fully checked asset set
+        id: assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-assets-${{ github.event.release.id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  upload:
+    name: Upload immutable assets to the triggering Release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+      - name: Download only this run's checked asset set
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist
+          merge-multiple: true
+      - name: Create the pinned cosmos upload toolbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman podman-toolbox
+          toolbox create --assumeyes --container cosmos --image registry.fedoraproject.org/fedora-toolbox@sha256:bb687ae7bbfc8b957b1ac04bb0fd92f8e443c657220e863cfdf76a692342d663
+          toolbox run --container cosmos sudo dnf install -y python3 git
+      - name: Preflight existing assets and upload missing assets without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          toolbox run --container cosmos env \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" GITHUB_EVENT_PATH="$GITHUB_EVENT_PATH" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" GH_TOKEN="$GH_TOKEN" \
+            python3 packaging/upload.py

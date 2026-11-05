@@ -11,3 +11,4 @@
 *.log
 .claude/
 .agents/
+__pycache__/

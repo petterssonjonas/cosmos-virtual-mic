@@ -1,8 +1,8 @@
-name: Validate development PR
+name: Validate PR
 
 on:
   pull_request:
-    branches: [development]
+    branches: [development, main]
 
 permissions:
   contents: read
@@ -27,6 +27,8 @@ jobs:
           toolbox create --assumeyes --container cosmos --image registry.fedoraproject.org/fedora-toolbox@sha256:bb687ae7bbfc8b957b1ac04bb0fd92f8e443c657220e863cfdf76a692342d663
       - name: Install native build dependencies
         run: |
+          # shellcheck disable=SC2016
+          # Variables in this script expand inside the toolbox, not on the runner.
           toolbox run --container cosmos bash -euo pipefail -c '
             mapfile -t packages < dependencies-fedora.txt
             sudo dnf install -y "${packages[@]}" rustup python3
@@ -34,6 +36,8 @@ jobs:
           '
       - name: Validate the locked workspace
         run: |
+          # shellcheck disable=SC2016
+          # Variables in this script expand inside the toolbox, not on the runner.
           toolbox run --container cosmos bash -euo pipefail -c '
             source ./dev-env.sh
             /usr/bin/rustup-init -y --no-modify-path --profile minimal --default-toolchain none
@@ -44,4 +48,20 @@ jobs:
             "$CARGO_HOME/bin/rustup" run "$toolchain" cargo test --workspace --locked
             "$CARGO_HOME/bin/rustup" run "$toolchain" cargo clippy --workspace --all-targets --locked -- -D warnings
             python3 tests/session-policy.py
+            python3 tests/installer.py
+            python3 tests/release-installer.py
+            python3 packaging/test_release.py
+            audit=$(mktemp -d)
+            python3 packaging/licenses.py "$audit/notices"
+            rm -rf -- "$audit"
+            bash -n install.sh install-release.sh packaging/build.sh
+          '
+      - name: Validate critical workflows for main
+        if: github.base_ref == 'main'
+        run: |
+          toolbox run --container cosmos bash -euo pipefail -c '
+            source ./dev-env.sh
+            python3 tests/engine-lifecycle.py
+            python3 tests/backend-audio.py
+            python3 tests/device-profiles.py
           '
